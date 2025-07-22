@@ -61,8 +61,8 @@ def main():
     # Optimizer and loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     loss_fn = torch.nn.L1Loss()
-    log_path = os.path.join(args.log_dir, args.logger_name)
-    logger = Logger(filename=log_path)
+    #log_path = os.path.join(args.log_dir, args.logger_name)
+    logger = Logger(exp_name=args.log_dir, filename=args.logger_name)
 
 
     for epoch in range(args.epochs):
