@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--learning_rate', type=float, default=0.0002)
+    parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
     parser.add_argument('--logger_name', type=str, default='training_log')
     args = parser.parse_args()
 
@@ -55,11 +56,14 @@ def main():
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    print(f"Training on {len(train_set)} samples, validating on {len(val_set)} samples.")
 
     # Optimizer and loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     loss_fn = torch.nn.L1Loss()
-    logger = Logger(filename=args.logger_name)
+    log_path = os.path.join(args.log_dir, args.logger_name)
+    logger = Logger(filename=log_path)
+
 
     for epoch in range(args.epochs):
         model.train()
