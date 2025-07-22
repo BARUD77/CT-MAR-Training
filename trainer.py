@@ -83,13 +83,15 @@ def main():
                 for i in range(x.size(0)):
                     total_ssim += calculate_ssim(pred[i], y[i])
                     total_psnr += calculate_psnr(pred[i], y[i])
-
-        logger.add_scalar("loss", train_loss / len(train_loader), epoch + 1)
-        logger.add_scalar("psnr", total_psnr / len(val_loader.dataset), epoch + 1)
-        logger.add_scalar("ssim", total_ssim / len(val_loader.dataset), epoch + 1)
+        avg_loss = train_loss / len(train_loader)
+        avg_psnr = total_psnr / len(val_loader.dataset)
+        avg_ssim = total_ssim / len(val_loader.dataset)
+        logger.add_scalar("loss", avg_loss, epoch + 1)
+        logger.add_scalar("psnr", avg_psnr, epoch + 1)
+        logger.add_scalar("ssim", avg_ssim, epoch + 1)
         logger.save_weights(model.state_dict(), f"{args.model}")
 
-        print(f"[Epoch {epoch+1}] Loss: {train_loss:.4f} PSNR: {total_psnr:.2f} SSIM: {total_ssim:.4f}")
+        print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f} PSNR: {avg_psnr:.2f} SSIM: {avg_ssim:.4f}")
 
     logger.close()
     print("✅ Training complete!")
