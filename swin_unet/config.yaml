@@ -12,7 +12,7 @@ MODEL:
     NUM_HEADS: [ 3, 6, 12, 24]
     WINDOW_SIZE: 8
     PATCH_SIZE: 4
-    IN_CHANS: 2
+    IN_CHANS: 1
     MLP_RATIO: 8
     QKV_BIAS: TRUE
     APE: TRUE

@@ -1,6 +1,5 @@
 import argparse
 import os
-import time
 import torch
 import yaml
 from types import SimpleNamespace
@@ -8,10 +7,9 @@ from torch.utils.data import DataLoader
 from dataset import CTMetalArtifactDataset
 from utils import Logger
 from metrics import calculate_ssim, calculate_psnr
-from swin_unet.vision_transformer import SwinUnet  # Example
-from unet import UnetGenerator  # Example
+from swin_unet.vision_transformer import SwinUnet   # assumes it reads config.MODEL.SWIN.IN_CHANS
+from unet import UnetGenerator                      # ensure it can take in_ch/input_nc if you use it
 
-# Convert nested dict to SimpleNamespace
 def dict_to_namespace(d):
     if isinstance(d, dict):
         return SimpleNamespace(**{k: dict_to_namespace(v) for k, v in d.items()})
@@ -27,69 +25,116 @@ def main():
     parser.add_argument('--model', type=str, choices=['unet', 'swinunet'], required=True)
     parser.add_argument('--config', type=str, help='Path to config.yaml (required for swinunet)')
     parser.add_argument('--ma_dir', type=str, required=True)
-    parser.add_argument('--li_dir', type=str, required=True)
+    parser.add_argument('--li_dir', type=str, required=False, help='Required if input_mode=ma_li')
     parser.add_argument('--gt_dir', type=str, required=True)
+    parser.add_argument('--input_mode', type=str, choices=['ma_li', 'ma'], default='ma',
+                        help="Use 'ma_li' for 2-ch input [MA,LI] or 'ma' for MA-only")
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--learning_rate', type=float, default=0.0002)
+    parser.add_argument('--learning_rate', type=float, default=2e-4)
     parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
     parser.add_argument('--logger_name', type=str, default='training_log')
     args = parser.parse_args()
 
-    # Handle SwinUnet YAML config
+    # Validate LI path only when needed
+    if args.input_mode == 'ma_li' and not args.li_dir:
+        raise ValueError("input_mode='ma_li' requires --li_dir")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    in_ch = 2 if args.input_mode == 'ma_li' else 1
+
+    # Handle model creation
     if args.model == 'swinunet':
         if not args.config:
             raise ValueError("SwinUnet requires --config path to YAML file.")
         config = load_config(args.config)
-        model = SwinUnet(config=config).to('cuda')
-        img_size = config.DATA.IMG_SIZE
+        # Force input channels based on input_mode
+        try:
+            config.MODEL.SWIN.IN_CHANS = in_ch
+        except AttributeError:
+            # if your config doesn't have this path, set it where your impl reads it
+            pass
+        model = SwinUnet(config=config).to(device)
     else:
-        model = UnetGenerator().to('cuda')
-        img_size = 512  # default for Unet
+        # Make sure your UnetGenerator accepts in_ch/input_nc; adjust if needed
+        try:
+            model = UnetGenerator(in_ch=in_ch).to(device)
+        except TypeError:
+            model = UnetGenerator().to(device)  # fallback; ensure first conv matches `in_ch`
 
-    # Dataset and loader
-    dataset = CTMetalArtifactDataset(ma_dir=args.ma_dir, li_dir=args.li_dir, gt_dir=args.gt_dir)
+    # Dataset (use serial if your head numbering is gappy)
+    dataset = CTMetalArtifactDataset(
+        args.ma_dir,
+        args.li_dir if args.input_mode == 'ma_li' else args.ma_dir,  # li_dir unused when input_mode='ma'
+        args.gt_dir,
+        split='train',
+        match_mode='serial',
+        include_body=True,
+        include_head=True,
+        input_mode=args.input_mode,
+        body_offset=12373
+    )
+
+    # Make a validation split from the training pool
     val_split = 0.15
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
     train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(
+        train_set, batch_size=args.batch_size, shuffle=True, num_workers=4,
+        pin_memory=True if device.type == 'cuda' else False
+    )
+    val_loader = DataLoader(
+        val_set, batch_size=args.batch_size, shuffle=False, num_workers=4,
+        pin_memory=True if device.type == 'cuda' else False
+    )
     print(f"Training on {len(train_set)} samples, validating on {len(val_set)} samples.")
 
     # Optimizer and loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     loss_fn = torch.nn.L1Loss()
-    #log_path = os.path.join(args.log_dir, args.logger_name)
     logger = Logger(exp_name=args.log_dir, filename=args.logger_name)
-
 
     for epoch in range(args.epochs):
         model.train()
-        train_loss = 0
+        train_loss = 0.0
         for x, y in train_loader:
-            x, y = x.cuda(), y.cuda()
-            optimizer.zero_grad()
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
             pred = model(x)
+
             loss = loss_fn(pred, y)
             loss.backward()
             optimizer.step()
+
             train_loss += loss.item()
 
         # Validation
         model.eval()
-        total_ssim = total_psnr = 0
+        total_ssim = 0.0
+        total_psnr = 0.0
         with torch.no_grad():
             for x, y in val_loader:
-                x, y = x.cuda(), y.cuda()
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
                 pred = model(x)
-                for i in range(x.size(0)):
-                    total_ssim += calculate_ssim(pred[i], y[i])
-                    total_psnr += calculate_psnr(pred[i], y[i])
-        avg_loss = train_loss / len(train_loader)
+
+                # Clamp to [0,1] for metrics and use single channel
+                pred_eval = torch.clamp(pred, 0, 1)
+                gt_eval   = torch.clamp(y,   0, 1)
+
+                for i in range(pred_eval.size(0)):
+                    # pass 2D tensors if your metric expects (H,W)
+                    total_ssim += calculate_ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
+                    total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
+
+        avg_loss = train_loss / max(1, len(train_loader))
         avg_psnr = total_psnr / len(val_loader.dataset)
         avg_ssim = total_ssim / len(val_loader.dataset)
+
         logger.add_scalar("loss", avg_loss, epoch + 1)
         logger.add_scalar("psnr", avg_psnr, epoch + 1)
         logger.add_scalar("ssim", avg_ssim, epoch + 1)

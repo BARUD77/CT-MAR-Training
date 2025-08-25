@@ -49,7 +49,7 @@ class SwinUnet(nn.Module):
         )
 
         # 2️⃣ 替换 Softmax，使用 Tanh 或 ReLU 输出像素值
-        self.final_activation = nn.Tanh()  # 适用于 [-1, 1] 归一化数据
+        self.final_activation = nn.Sigmoid()  # Sigmoid activation for [0, 1] pixel range
         # self.final_activation = nn.ReLU()  # 如果像素范围是 [0, 1]
 
     def forward(self, x):
