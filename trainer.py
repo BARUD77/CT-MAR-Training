@@ -9,6 +9,8 @@ from utils import Logger
 from metrics import calculate_ssim, calculate_psnr
 from swin_unet.vision_transformer import SwinUnet   # assumes it reads config.MODEL.SWIN.IN_CHANS
 from unet import UnetGenerator                      # ensure it can take in_ch/input_nc if you use it
+import numpy as np
+from skimage.metrics import structural_similarity as ssim
 
 def dict_to_namespace(d):
     if isinstance(d, dict):
@@ -80,6 +82,34 @@ def main():
         global_min=-7387.15771484375,
         global_max=65204.90625 
     )
+    # Sanity check
+    # after you created val_ds = CTMetalArtifactDataset(...)
+
+    val_loader1 = DataLoader(val_ds, batch_size=1, shuffle=False)
+
+    ssim_ma_gt = 0.0
+    ssim_zero = 0.0
+    ssim_rand = 0.0
+    n = 0
+    with torch.no_grad():
+        for x, y in val_loader1:
+            ma = x[0,0].cpu().numpy().astype(np.float32)
+            gt = y[0,0].cpu().numpy().astype(np.float32)
+
+            ssim_ma_gt += ssim(ma, gt, data_range=1.0)
+
+            zero = np.zeros_like(gt)
+            ssim_zero += ssim(zero, gt, data_range=1.0)
+
+            rnd = np.random.rand(*gt.shape).astype(np.float32)
+            ssim_rand += ssim(rnd, gt, data_range=1.0)
+
+            n += 1
+
+    print("Baseline SSIM:  MA→GT =", ssim_ma_gt/n,
+        " zero→GT =", ssim_zero/n,
+        " random→GT =", ssim_rand/n)
+
 
 
 
@@ -136,7 +166,9 @@ def main():
 
                 for i in range(pred_eval.size(0)):
                     # pass 2D tensors if your metric expects (H,W)
-                    total_ssim += calculate_ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
+                    #total_ssim += calculate_ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
+                    #total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
+                    total_ssim += ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
                     total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
 
         avg_loss = train_loss / max(1, len(train_loader))
