@@ -63,7 +63,7 @@ def main():
             model = UnetGenerator().to(device)  # fallback; ensure first conv matches `in_ch`
 
     # Dataset (use serial if your head numbering is gappy)
-    dataset = CTMetalArtifactDataset(
+    train_ds = CTMetalArtifactDataset(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
         split='train',
@@ -72,21 +72,32 @@ def main():
         global_max=65204.90625 
     )
 
+    val_ds = CTMetalArtifactDataset(
+        ma_dir=args.ma_dir,
+        gt_dir=args.gt_dir,
+        split='val',
+        normalize='global',
+        global_min=-7387.15771484375,
+        global_max=65204.90625 
+    )
+
+
+
     # Make a validation split from the training pool
-    val_split = 0.15
-    val_size = int(len(dataset) * val_split)
-    train_size = len(dataset) - val_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    # val_split = 0.15
+    # val_size = int(len(dataset) * val_split)
+    # train_size = len(dataset) - val_size
+    # train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
 
     train_loader = DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=True, num_workers=4,
+        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4,
         pin_memory=True if device.type == 'cuda' else False
     )
     val_loader = DataLoader(
-        val_set, batch_size=args.batch_size, shuffle=False, num_workers=4,
+        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4,
         pin_memory=True if device.type == 'cuda' else False
     )
-    print(f"Training on {len(train_set)} samples, validating on {len(val_set)} samples.")
+    print(f"Training on {len(train_ds)} samples, validating on {len(val_ds)} samples.")
 
     # Optimizer and loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
