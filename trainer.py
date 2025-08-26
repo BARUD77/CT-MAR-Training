@@ -64,15 +64,12 @@ def main():
 
     # Dataset (use serial if your head numbering is gappy)
     dataset = CTMetalArtifactDataset(
-        args.ma_dir,
-        args.li_dir if args.input_mode == 'ma_li' else args.ma_dir,  # li_dir unused when input_mode='ma'
-        args.gt_dir,
+        ma_dir=args.ma_dir,
+        gt_dir=args.gt_dir,
         split='train',
-        match_mode='serial',
-        include_body=True,
-        include_head=True,
-        input_mode=args.input_mode,
-        body_offset=12373
+        normalize='global',
+        global_min=-7387.15771484375,
+        global_max=65204.90625 
     )
 
     # Make a validation split from the training pool
