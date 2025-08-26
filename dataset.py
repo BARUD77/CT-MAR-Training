@@ -308,6 +308,243 @@
 #             y = self.transform(y)
 #         return x, y
 
+
+# dataset.py for .npy mode
+
+# import os
+# import re
+# import numpy as np
+# import torch
+# from torch.utils.data import Dataset
+# from sklearn.model_selection import train_test_split
+
+# class CTMetalArtifactDataset(Dataset):
+#     def __init__(
+#         self,
+#         ma_dir,
+#         li_dir,
+#         gt_dir,
+#         split='train',
+#         val_size=0.1,
+#         test_size=0.1,
+#         seed=42,
+#         transform=None,
+#         body_offset=12373,      # last BODY global id; HEAD global ids start at body_offset+1
+#         include_body=True,
+#         include_head=True,
+#         match_mode='id',        # 'id' (exact id match) or 'serial' (order-based)
+#         input_mode='ma_li'      # 'ma_li' (2-ch input) or 'ma' (MA-only, 1-ch input)
+#     ):
+#         """
+#         Filenames:
+#           MA: training_{body|head}_metalart_img{LOCAL_ID}_*.npy
+#           LI: training_{body|head}_li_img{LOCAL_ID}_*.npy
+#           GT: Simulated_Image_{GLOBAL_ID}_*.npy
+#               (GLOBAL_ID: body: LOCAL_ID, head: body_offset + LOCAL_ID)
+
+#         input_mode:
+#           - 'ma_li': model input = [MA, LI]  (2 channels)
+#           - 'ma'   : model input = [MA]      (1 channel)  <-- LI not required
+#         """
+#         assert include_body or include_head, "At least one of include_body/include_head must be True."
+#         assert match_mode in ('id', 'serial')
+#         assert input_mode in ('ma_li', 'ma')
+
+#         self.ma_dir = ma_dir
+#         self.li_dir = li_dir
+#         self.gt_dir = gt_dir
+#         self.transform = transform
+#         self.image_shape = (512, 512)
+#         self.global_min = -7387.15771484375
+#         self.global_max = 65204.90625
+#         self.body_offset = int(body_offset)
+#         self.match_mode = match_mode
+#         self.input_mode = input_mode
+#         self.require_li = (input_mode == 'ma_li')
+
+#         # ---- Regex ----
+#         ma_pat_local = re.compile(r'^training_(body|head)_metalart_img(\d+)_')
+#         li_pat_local = re.compile(r'^training_(body|head)_li_img(\d+)_')
+#         gt_pat_global = re.compile(r'^Simulated_Image_(\d+)(?:_|\.npy)')
+
+#         def list_npy(d): 
+#             return [f for f in os.listdir(d) if f.endswith('.npy')]
+
+#         # ---- Collect per-subset LOCAL maps for MA/LI: subset -> {local_id: filename}
+#         def collect_local_maps(dir_path, pattern, want_li=True):
+#             maps = {'body': {}, 'head': {}}
+#             if (not want_li) and (pattern is li_pat_local):
+#                 return maps  # don't fill if LI not required
+#             for f in list_npy(dir_path):
+#                 m = pattern.match(f)
+#                 if not m:
+#                     continue
+#                 subset, local_id = m.group(1), int(m.group(2))
+#                 if subset == 'body' and include_body:
+#                     maps['body'][local_id] = f
+#                 elif subset == 'head' and include_head:
+#                     maps['head'][local_id] = f
+#             return maps
+
+#         ma_local = collect_local_maps(self.ma_dir, ma_pat_local, want_li=True)
+#         li_local = collect_local_maps(self.li_dir, li_pat_local, want_li=self.require_li)
+
+#         # ---- Helper to get global id
+#         def to_global_id(subset, local_id):
+#             return local_id if subset == 'body' else self.body_offset + local_id
+
+#         # ---- Build matches
+#         if match_mode == 'id':
+#             # Build MA global map
+#             ma_map = {}
+#             for subset in ('body', 'head'):
+#                 for lid, f in ma_local[subset].items():
+#                     ma_map[to_global_id(subset, lid)] = f
+
+#             # Build LI global map only if required
+#             li_map = {}
+#             if self.require_li:
+#                 for subset in ('body', 'head'):
+#                     for lid, f in li_local[subset].items():
+#                         li_map[to_global_id(subset, lid)] = f
+
+#             # GT global map (filter to chosen subsets)
+#             gt_map = {}
+#             for f in list_npy(self.gt_dir):
+#                 m = gt_pat_global.match(f)
+#                 if not m:
+#                     continue
+#                 gid = int(m.group(1))
+#                 if (include_body and 1 <= gid <= self.body_offset) or (include_head and gid > self.body_offset):
+#                     gt_map[gid] = f
+
+#             if self.require_li:
+#                 common_ids = sorted(set(ma_map).intersection(li_map).intersection(gt_map))
+#                 matched = [(ma_map[i], li_map[i], gt_map[i]) for i in common_ids]
+#             else:
+#                 common_ids = sorted(set(ma_map).intersection(gt_map))
+#                 # store a placeholder for LI (None) so __getitem__ knows to skip loading it
+#                 matched = [(ma_map[i], None, gt_map[i]) for i in common_ids]
+
+#             matched_triplets = matched
+#             body_kept = sum(1 for i in common_ids if 1 <= i <= self.body_offset)
+#             head_kept = sum(1 for i in common_ids if i > self.body_offset)
+
+#         else:  # match_mode == 'serial'
+#             matched_triplets = []
+#             body_kept = head_kept = 0
+
+#             # Build GT global dict once
+#             gt_global = {}
+#             for f in list_npy(self.gt_dir):
+#                 m = gt_pat_global.match(f)
+#                 if not m:
+#                     continue
+#                 gt_global[int(m.group(1))] = f
+
+#             for subset in ('body', 'head'):
+#                 if subset == 'body' and not include_body:
+#                     continue
+#                 if subset == 'head' and not include_head:
+#                     continue
+
+#                 # MA ids
+#                 ma_ids = sorted(ma_local[subset].keys())
+#                 if self.require_li:
+#                     # Only pairs that exist in both MA and LI
+#                     common_local = sorted(set(ma_local[subset]).intersection(li_local[subset]))
+#                     ma_li_pairs_sorted = [(ma_local[subset][i], li_local[subset][i]) for i in common_local]
+#                 else:
+#                     # MA only
+#                     ma_li_pairs_sorted = [(ma_local[subset][i], None) for i in ma_ids]
+
+#                 # GT list for this subset, sorted by GLOBAL id
+#                 if subset == 'body':
+#                     g_candidates = sorted([gid for gid in gt_global if 1 <= gid <= self.body_offset])
+#                 else:
+#                     g_candidates = sorted([gid for gid in gt_global if gid > self.body_offset])
+
+#                 gt_list_sorted = [gt_global[gid] for gid in g_candidates]
+
+#                 mlen = min(len(ma_li_pairs_sorted), len(gt_list_sorted))
+#                 for k in range(mlen):
+#                     ma_f, li_f = ma_li_pairs_sorted[k]
+#                     gt_f = gt_list_sorted[k]
+#                     matched_triplets.append((ma_f, li_f, gt_f))
+
+#                 if subset == 'body':
+#                     body_kept = mlen
+#                 else:
+#                     head_kept = mlen
+
+#         if not matched_triplets:
+#             raise RuntimeError("No matched samples. Check dirs/patterns/body_offset/match_mode/input_mode.")
+
+#         # ---- Train/Val/Test split (reproducible)
+#         train_val, test = train_test_split(matched_triplets, test_size=test_size, random_state=seed, shuffle=True)
+#         eff_val = 0 if val_size == 0 else val_size / (1 - test_size)
+#         if eff_val > 0:
+#             train, val = train_test_split(train_val, test_size=eff_val, random_state=seed, shuffle=True)
+#         else:
+#             train, val = train_val, []
+
+#         if split == 'train':
+#             self.pairs = train
+#         elif split == 'val':
+#             self.pairs = val
+#         elif split == 'test':
+#             self.pairs = test
+#         else:
+#             raise ValueError("split must be one of ['train','val','test']")
+
+#         total_kept = len(matched_triplets)
+#         print(f"[CTDataset] match_mode={match_mode} input_mode={input_mode} | kept: total={total_kept}, "
+#               f"body={body_kept}, head={head_kept} | splits -> train={len(train)}, val={len(val)}, test={len(test)}")
+
+#     def __len__(self):
+#         return len(self.pairs)
+
+#     def _load_npy_img(self, path):
+#         arr = np.load(path)
+#         if arr.ndim == 3 and arr.shape[-1] == 1:
+#             arr = arr[..., 0]
+#         arr = np.squeeze(arr)
+#         assert tuple(arr.shape) == self.image_shape, f"Unexpected shape {arr.shape} for {path}"
+#         return arr
+
+#     def __getitem__(self, idx):
+#         ma_file, li_file, gt_file = self.pairs[idx]
+
+#         ma_path = os.path.join(self.ma_dir, ma_file)
+#         gt_path = os.path.join(self.gt_dir, gt_file)
+
+#         ma_image = self._load_npy_img(ma_path)
+#         gt_image = self._load_npy_img(gt_path)
+
+#         # Normalize to [0,1]
+#         denom = (self.global_max - self.global_min)
+#         ma_image = np.clip((ma_image - self.global_min) / denom, 0, 1)
+#         gt_image = np.clip((gt_image - self.global_min) / denom, 0, 1)
+
+#         if self.input_mode == 'ma_li':
+#             assert li_file is not None, "input_mode='ma_li' requires LI files."
+#             li_path = os.path.join(self.li_dir, li_file)
+#             li_image = self._load_npy_img(li_path)
+#             li_image = np.clip((li_image - self.global_min) / denom, 0, 1)
+#             x_np = np.stack([ma_image, li_image], axis=0)   # (2,H,W)
+#         else:
+#             x_np = np.expand_dims(ma_image, axis=0)         # (1,H,W)
+
+#         y_np = np.expand_dims(gt_image, axis=0)             # (1,H,W)
+
+#         x = torch.tensor(x_np, dtype=torch.float32)
+#         y = torch.tensor(y_np, dtype=torch.float32)
+#         if self.transform:
+#             x = self.transform(x)
+#             y = self.transform(y)
+#         return x, y
+
+
 import os
 import re
 import numpy as np
@@ -316,169 +553,80 @@ from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
 
 class CTMetalArtifactDataset(Dataset):
+    """
+    MA→GT pairs from .raw (float32) images of size 512x512.
+
+    Filenames:
+      MA: Input_Image_{ID}_512x512.raw
+      GT: Simulated_Image_{ID}_512x512.raw
+
+    Normalization:
+      normalize = 'none'       -> return raw float32 as-is
+                  'per_image'  -> per-image min-max to [0,1]
+                  'global'     -> (x - global_min) / (global_max - global_min)
+                                  (requires global_min/global_max)
+
+    Returns tensors:
+      x: (1, 512, 512)  # MA
+      y: (1, 512, 512)  # GT
+    """
+
     def __init__(
         self,
         ma_dir,
-        li_dir,
         gt_dir,
         split='train',
         val_size=0.1,
         test_size=0.1,
         seed=42,
         transform=None,
-        body_offset=12373,      # last BODY global id; HEAD global ids start at body_offset+1
-        include_body=True,
-        include_head=True,
-        match_mode='id',        # 'id' (exact id match) or 'serial' (order-based)
-        input_mode='ma_li'      # 'ma_li' (2-ch input) or 'ma' (MA-only, 1-ch input)
+        normalize='none',       # 'none' | 'per_image' | 'global'
+        global_min=None,
+        global_max=None,
+        image_shape=(512, 512),
     ):
-        """
-        Filenames:
-          MA: training_{body|head}_metalart_img{LOCAL_ID}_*.npy
-          LI: training_{body|head}_li_img{LOCAL_ID}_*.npy
-          GT: Simulated_Image_{GLOBAL_ID}_*.npy
-              (GLOBAL_ID: body: LOCAL_ID, head: body_offset + LOCAL_ID)
-
-        input_mode:
-          - 'ma_li': model input = [MA, LI]  (2 channels)
-          - 'ma'   : model input = [MA]      (1 channel)  <-- LI not required
-        """
-        assert include_body or include_head, "At least one of include_body/include_head must be True."
-        assert match_mode in ('id', 'serial')
-        assert input_mode in ('ma_li', 'ma')
+        assert split in ('train', 'val', 'test')
+        assert normalize in ('none', 'per_image', 'global')
+        if normalize == 'global':
+            assert global_min is not None and global_max is not None and global_max > global_min, \
+                "Provide valid global_min/global_max for normalize='global'."
 
         self.ma_dir = ma_dir
-        self.li_dir = li_dir
         self.gt_dir = gt_dir
         self.transform = transform
-        self.image_shape = (512, 512)
-        self.global_min = -7387.15771484375
-        self.global_max = 65204.90625
-        self.body_offset = int(body_offset)
-        self.match_mode = match_mode
-        self.input_mode = input_mode
-        self.require_li = (input_mode == 'ma_li')
+        self.normalize = normalize
+        self.global_min = global_min
+        self.global_max = global_max
+        self.image_shape = tuple(image_shape)
+        self._numel = self.image_shape[0] * self.image_shape[1]
 
-        # ---- Regex ----
-        ma_pat_local = re.compile(r'^training_(body|head)_metalart_img(\d+)_')
-        li_pat_local = re.compile(r'^training_(body|head)_li_img(\d+)_')
-        gt_pat_global = re.compile(r'^Simulated_Image_(\d+)(?:_|\.npy)')
+        # Patterns
+        ma_pat = re.compile(r'^Input_Image_(\d+)_512x512(?:\.raw)?$', re.IGNORECASE)
+        gt_pat = re.compile(r'^Simulated_Image_(\d+)_512x512(?:\.raw)?$', re.IGNORECASE)
 
-        def list_npy(d): 
-            return [f for f in os.listdir(d) if f.endswith('.npy')]
+        def list_raw(d):
+            return [f for f in os.listdir(d) if f.lower().endswith('.raw')]
 
-        # ---- Collect per-subset LOCAL maps for MA/LI: subset -> {local_id: filename}
-        def collect_local_maps(dir_path, pattern, want_li=True):
-            maps = {'body': {}, 'head': {}}
-            if (not want_li) and (pattern is li_pat_local):
-                return maps  # don't fill if LI not required
-            for f in list_npy(dir_path):
-                m = pattern.match(f)
-                if not m:
-                    continue
-                subset, local_id = m.group(1), int(m.group(2))
-                if subset == 'body' and include_body:
-                    maps['body'][local_id] = f
-                elif subset == 'head' and include_head:
-                    maps['head'][local_id] = f
-            return maps
+        # Index MA and GT by integer ID
+        ma_map, gt_map = {}, {}
+        for f in list_raw(ma_dir):
+            m = ma_pat.match(f)
+            if m:
+                ma_map[int(m.group(1))] = f
+        for f in list_raw(gt_dir):
+            m = gt_pat.match(f)
+            if m:
+                gt_map[int(m.group(1))] = f
 
-        ma_local = collect_local_maps(self.ma_dir, ma_pat_local, want_li=True)
-        li_local = collect_local_maps(self.li_dir, li_pat_local, want_li=self.require_li)
+        # Match by ID intersection
+        common_ids = sorted(set(ma_map).intersection(gt_map))
+        if not common_ids:
+            raise RuntimeError("No matched MA/GT pairs found. Check file names and directories.")
 
-        # ---- Helper to get global id
-        def to_global_id(subset, local_id):
-            return local_id if subset == 'body' else self.body_offset + local_id
+        pairs = [(ma_map[i], gt_map[i]) for i in common_ids]
 
-        # ---- Build matches
-        if match_mode == 'id':
-            # Build MA global map
-            ma_map = {}
-            for subset in ('body', 'head'):
-                for lid, f in ma_local[subset].items():
-                    ma_map[to_global_id(subset, lid)] = f
-
-            # Build LI global map only if required
-            li_map = {}
-            if self.require_li:
-                for subset in ('body', 'head'):
-                    for lid, f in li_local[subset].items():
-                        li_map[to_global_id(subset, lid)] = f
-
-            # GT global map (filter to chosen subsets)
-            gt_map = {}
-            for f in list_npy(self.gt_dir):
-                m = gt_pat_global.match(f)
-                if not m:
-                    continue
-                gid = int(m.group(1))
-                if (include_body and 1 <= gid <= self.body_offset) or (include_head and gid > self.body_offset):
-                    gt_map[gid] = f
-
-            if self.require_li:
-                common_ids = sorted(set(ma_map).intersection(li_map).intersection(gt_map))
-                matched = [(ma_map[i], li_map[i], gt_map[i]) for i in common_ids]
-            else:
-                common_ids = sorted(set(ma_map).intersection(gt_map))
-                # store a placeholder for LI (None) so __getitem__ knows to skip loading it
-                matched = [(ma_map[i], None, gt_map[i]) for i in common_ids]
-
-            matched_triplets = matched
-            body_kept = sum(1 for i in common_ids if 1 <= i <= self.body_offset)
-            head_kept = sum(1 for i in common_ids if i > self.body_offset)
-
-        else:  # match_mode == 'serial'
-            matched_triplets = []
-            body_kept = head_kept = 0
-
-            # Build GT global dict once
-            gt_global = {}
-            for f in list_npy(self.gt_dir):
-                m = gt_pat_global.match(f)
-                if not m:
-                    continue
-                gt_global[int(m.group(1))] = f
-
-            for subset in ('body', 'head'):
-                if subset == 'body' and not include_body:
-                    continue
-                if subset == 'head' and not include_head:
-                    continue
-
-                # MA ids
-                ma_ids = sorted(ma_local[subset].keys())
-                if self.require_li:
-                    # Only pairs that exist in both MA and LI
-                    common_local = sorted(set(ma_local[subset]).intersection(li_local[subset]))
-                    ma_li_pairs_sorted = [(ma_local[subset][i], li_local[subset][i]) for i in common_local]
-                else:
-                    # MA only
-                    ma_li_pairs_sorted = [(ma_local[subset][i], None) for i in ma_ids]
-
-                # GT list for this subset, sorted by GLOBAL id
-                if subset == 'body':
-                    g_candidates = sorted([gid for gid in gt_global if 1 <= gid <= self.body_offset])
-                else:
-                    g_candidates = sorted([gid for gid in gt_global if gid > self.body_offset])
-
-                gt_list_sorted = [gt_global[gid] for gid in g_candidates]
-
-                mlen = min(len(ma_li_pairs_sorted), len(gt_list_sorted))
-                for k in range(mlen):
-                    ma_f, li_f = ma_li_pairs_sorted[k]
-                    gt_f = gt_list_sorted[k]
-                    matched_triplets.append((ma_f, li_f, gt_f))
-
-                if subset == 'body':
-                    body_kept = mlen
-                else:
-                    head_kept = mlen
-
-        if not matched_triplets:
-            raise RuntimeError("No matched samples. Check dirs/patterns/body_offset/match_mode/input_mode.")
-
-        # ---- Train/Val/Test split (reproducible)
-        train_val, test = train_test_split(matched_triplets, test_size=test_size, random_state=seed, shuffle=True)
+        # Train/val/test split (reproducible)
+        train_val, test = train_test_split(pairs, test_size=test_size, random_state=seed, shuffle=True)
         eff_val = 0 if val_size == 0 else val_size / (1 - test_size)
         if eff_val > 0:
             train, val = train_test_split(train_val, test_size=eff_val, random_state=seed, shuffle=True)
@@ -489,55 +637,58 @@ class CTMetalArtifactDataset(Dataset):
             self.pairs = train
         elif split == 'val':
             self.pairs = val
-        elif split == 'test':
-            self.pairs = test
         else:
-            raise ValueError("split must be one of ['train','val','test']")
+            self.pairs = test
 
-        total_kept = len(matched_triplets)
-        print(f"[CTDataset] match_mode={match_mode} input_mode={input_mode} | kept: total={total_kept}, "
-              f"body={body_kept}, head={head_kept} | splits -> train={len(train)}, val={len(val)}, test={len(test)}")
+        print(f"[CTDataset] MA-GT pairs: total={len(pairs)} | splits -> "
+              f"train={len(train)}, val={len(val)}, test={len(test)} | normalize={normalize}")
 
     def __len__(self):
         return len(self.pairs)
 
-    def _load_npy_img(self, path):
-        arr = np.load(path)
-        if arr.ndim == 3 and arr.shape[-1] == 1:
-            arr = arr[..., 0]
-        arr = np.squeeze(arr)
-        assert tuple(arr.shape) == self.image_shape, f"Unexpected shape {arr.shape} for {path}"
+    def _load_raw_img(self, path):
+        """Read .raw float32 file and reshape to (H,W)."""
+        arr = np.fromfile(path, dtype=np.float32, count=self._numel)
+        if arr.size != self._numel:
+            raise ValueError(f"Unexpected file size for {path}. "
+                             f"Expected {self._numel} float32 values, got {arr.size}.")
+        arr = arr.reshape(self.image_shape)
         return arr
 
+    @staticmethod
+    def _minmax01(arr):
+        mn, mx = arr.min(), arr.max()
+        if mx > mn:
+            return (arr - mn) / (mx - mn)
+        return np.zeros_like(arr, dtype=np.float32)
+
+    def _apply_normalize(self, arr):
+        if self.normalize == 'none':
+            return arr
+        if self.normalize == 'per_image':
+            return self._minmax01(arr)
+        # global
+        out = (arr - self.global_min) / (self.global_max - self.global_min)
+        return np.clip(out, 0.0, 1.0)
+
     def __getitem__(self, idx):
-        ma_file, li_file, gt_file = self.pairs[idx]
+        ma_file, gt_file = self.pairs[idx]
 
         ma_path = os.path.join(self.ma_dir, ma_file)
         gt_path = os.path.join(self.gt_dir, gt_file)
 
-        ma_image = self._load_npy_img(ma_path)
-        gt_image = self._load_npy_img(gt_path)
+        ma = self._load_raw_img(ma_path).astype(np.float32)
+        gt = self._load_raw_img(gt_path).astype(np.float32)
 
-        # Normalize to [0,1]
-        denom = (self.global_max - self.global_min)
-        ma_image = np.clip((ma_image - self.global_min) / denom, 0, 1)
-        gt_image = np.clip((gt_image - self.global_min) / denom, 0, 1)
+        ma = self._apply_normalize(ma)
+        gt = self._apply_normalize(gt)
 
-        if self.input_mode == 'ma_li':
-            assert li_file is not None, "input_mode='ma_li' requires LI files."
-            li_path = os.path.join(self.li_dir, li_file)
-            li_image = self._load_npy_img(li_path)
-            li_image = np.clip((li_image - self.global_min) / denom, 0, 1)
-            x_np = np.stack([ma_image, li_image], axis=0)   # (2,H,W)
-        else:
-            x_np = np.expand_dims(ma_image, axis=0)         # (1,H,W)
+        x = torch.from_numpy(np.expand_dims(ma, axis=0))  # (1,H,W)
+        y = torch.from_numpy(np.expand_dims(gt, axis=0))  # (1,H,W)
 
-        y_np = np.expand_dims(gt_image, axis=0)             # (1,H,W)
-
-        x = torch.tensor(x_np, dtype=torch.float32)
-        y = torch.tensor(y_np, dtype=torch.float32)
         if self.transform:
             x = self.transform(x)
             y = self.transform(y)
         return x, y
+
 
