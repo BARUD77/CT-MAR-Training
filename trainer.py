@@ -104,11 +104,11 @@ def main():
 
             ssim_ma_gt += ssim(ma_np, gt_np, data_range=1.0)
 
-            zero = np.zeros_like(gt)
-            ssim_zero += ssim(zero, gt, data_range=1.0)
+            zero = np.zeros_like(gt_np)
+            ssim_zero += ssim(zero, gt_np, data_range=1.0)
 
-            rnd = np.random.rand(*gt.shape).astype(np.float32)
-            ssim_rand += ssim(rnd, gt, data_range=1.0)
+            rnd = np.random.rand(*gt_np.shape).astype(np.float32)
+            ssim_rand += ssim(rnd, gt_np, data_range=1.0)
 
             n += 1
 
