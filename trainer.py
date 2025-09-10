@@ -22,6 +22,12 @@ def load_config(config_path):
         cfg_dict = yaml.safe_load(f)
     return dict_to_namespace(cfg_dict)
 
+def normalize_hu(hu, min_hu=-1024, max_hu=3072, do_clip=False):
+    if do_clip:
+        hu = np.clip(hu, min_hu, max_hu)
+    norm_hu = (hu - min_hu) / (max_hu - min_hu)  # Normalize to [0,1]
+    return norm_hu
+
 def main():
     parser = argparse.ArgumentParser(description="Training script")
     parser.add_argument('--model', type=str, choices=['unet', 'swinunet'], required=True)
@@ -91,7 +97,12 @@ def main():
             ma = x[0,0].cpu().numpy().astype(np.float32)
             gt = y[0,0].cpu().numpy().astype(np.float32)
 
-            ssim_ma_gt += ssim(ma, gt, data_range=1.0)
+            ma_np = normalize_hu(ma, min_hu=-1024, max_hu=3072, do_clip=True)
+            gt_np = normalize_hu(gt, min_hu=-1024, max_hu=3072, do_clip=True)
+
+
+
+            ssim_ma_gt += ssim(ma_np, gt_np, data_range=1.0)
 
             zero = np.zeros_like(gt)
             ssim_zero += ssim(zero, gt, data_range=1.0)
