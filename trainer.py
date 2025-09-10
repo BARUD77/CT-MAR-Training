@@ -88,34 +88,6 @@ def main():
 
     val_loader1 = DataLoader(val_ds, batch_size=1, shuffle=False)
 
-    ssim_ma_gt = 0.0
-    ssim_zero = 0.0
-    ssim_rand = 0.0
-    n = 0
-    with torch.no_grad():
-        for x, y in val_loader1:
-            ma = x[0,0].cpu().numpy().astype(np.float32)
-            gt = y[0,0].cpu().numpy().astype(np.float32)
-
-            ma_np = normalize_hu(ma, min_hu=-1024, max_hu=3072, do_clip=True)
-            gt_np = normalize_hu(gt, min_hu=-1024, max_hu=3072, do_clip=True)
-
-
-
-            ssim_ma_gt += ssim(ma_np, gt_np, data_range=1.0)
-
-            zero = np.zeros_like(gt_np)
-            ssim_zero += ssim(zero, gt_np, data_range=1.0)
-
-            rnd = np.random.rand(*gt_np.shape).astype(np.float32)
-            ssim_rand += ssim(rnd, gt_np, data_range=1.0)
-
-            n += 1
-
-    print("Baseline SSIM:  MA→GT =", ssim_ma_gt/n,
-        " zero→GT =", ssim_zero/n,
-        " random→GT =", ssim_rand/n)
-
 
 
 
