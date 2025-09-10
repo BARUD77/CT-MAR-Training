@@ -22,12 +22,6 @@ def load_config(config_path):
         cfg_dict = yaml.safe_load(f)
     return dict_to_namespace(cfg_dict)
 
-def normalize_hu(hu, min_hu=-1024, max_hu=3072, do_clip=False):
-    if do_clip:
-        hu = np.clip(hu, min_hu, max_hu)
-    norm_hu = (hu - min_hu) / (max_hu - min_hu)  # Normalize to [0,1]
-    return norm_hu
-
 def main():
     parser = argparse.ArgumentParser(description="Training script")
     parser.add_argument('--model', type=str, choices=['unet', 'swinunet'], required=True)
@@ -71,18 +65,27 @@ def main():
             model = UnetGenerator().to(device)  # fallback; ensure first conv matches `in_ch`
 
     # Dataset (use serial if your head numbering is gappy)
+    # Example: using fixed HU window and (optionally) a mask dir
+    HU_MIN, HU_MAX = -1024.0, 3072.0
+
     train_ds = CTMetalArtifactDataset(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
+        mask_dir=None,              # or provide path if you have masks
         split='train',
-        normalize='per_image'
+        hu_min=HU_MIN,
+        hu_max=HU_MAX
     )
 
     val_ds = CTMetalArtifactDataset(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
+        mask_dir=None,              # or provide mask path
         split='val',
-        normalize='per_image')
+        hu_min=HU_MIN,
+        hu_max=HU_MAX
+    )
+
     # Sanity check
     # after you created val_ds = CTMetalArtifactDataset(...)
 
@@ -144,8 +147,8 @@ def main():
 
                 for i in range(pred_eval.size(0)):
                     # pass 2D tensors if your metric expects (H,W)
-                    total_ssim += calculate_ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
-                    total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
+                    total_ssim += calculate_ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), datarange=1.0)
+                    total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), datarange=1.0)
                     #total_ssim += ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
                     #total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
 
