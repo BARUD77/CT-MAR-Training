@@ -555,140 +555,160 @@ from sklearn.model_selection import train_test_split
 class CTMetalArtifactDataset(Dataset):
     """
     MA→GT pairs from .raw (float32) images of size 512x512.
-
-    Filenames:
-      MA: Input_Image_{ID}_512x512.raw
-      GT: Simulated_Image_{ID}_512x512.raw
-
-    Normalization:
-      normalize = 'none'       -> return raw float32 as-is
-                  'per_image'  -> per-image min-max to [0,1]
-                  'global'     -> (x - global_min) / (global_max - global_min)
-                                  (requires global_min/global_max)
-
-    Returns tensors:
-      x: (1, 512, 512)  # MA
-      y: (1, 512, 512)  # GT
+    Pipeline:
+      1) load raw HU
+      2) clip to [hu_min, hu_max]
+      3) normalize to [0,1]
+    Returns:
+      x: (1, H, W)  normalized MA  in [0,1]
+      y: (1, H, W)  normalized GT  in [0,1]
+      m: (1, H, W)  mask (0/1 float) if mask_dir is given, else None
+    NOTE: mask is returned but NOT applied/multiplied here.
     """
 
     def __init__(
         self,
-        ma_dir,
-        gt_dir,
-        split='train',
-        val_size=0.1,
-        test_size=0.1,
-        seed=42,
+        ma_dir: str,
+        gt_dir: str,
+        mask_dir: str | None = None,   # optional
+        split: str = 'train',
+        val_size: float = 0.1,
+        test_size: float = 0.1,
+        seed: int = 42,
+        image_shape: tuple[int, int] = (512, 512),
+        hu_min: float = -1024.0,
+        hu_max: float = 3072.0,        # global window for clipping/normalization
         transform=None,
-        normalize='none',       # 'none' | 'per_image' | 'global'
-        global_min=None,
-        global_max=None,
-        image_shape=(512, 512),
     ):
         assert split in ('train', 'val', 'test')
-        assert normalize in ('none', 'per_image', 'global')
-        if normalize == 'global':
-            assert global_min is not None and global_max is not None and global_max > global_min, \
-                "Provide valid global_min/global_max for normalize='global'."
+        assert hu_max > hu_min
 
-        self.ma_dir = ma_dir
-        self.gt_dir = gt_dir
+        self.ma_dir   = ma_dir
+        self.gt_dir   = gt_dir
+        self.mask_dir = mask_dir
+        self.split    = split
         self.transform = transform
-        self.normalize = normalize
-        self.global_min = global_min
-        self.global_max = global_max
+
         self.image_shape = tuple(image_shape)
         self._numel = self.image_shape[0] * self.image_shape[1]
 
-        # Patterns
-        ma_pat = re.compile(r'^Input_Image_(\d+)_512x512(?:\.raw)?$', re.IGNORECASE)
-        gt_pat = re.compile(r'^Simulated_Image_(\d+)_512x512(?:\.raw)?$', re.IGNORECASE)
+        self.hu_min = float(hu_min)
+        self.hu_max = float(hu_max)
+        self._dr = self.hu_max - self.hu_min  # data_range for [0,1] mapping
+
+        # filename patterns (adjust if yours differ)
+        ma_pat   = re.compile(r'^Input_Image_(\d+)_512x512(?:\.raw)?$',      re.IGNORECASE)
+        gt_pat   = re.compile(r'^Simulated_Image_(\d+)_512x512(?:\.raw)?$',  re.IGNORECASE)
+        mask_pat = re.compile(r'^.*mask.*_(\d+)_512x512(?:\.raw)?$',         re.IGNORECASE)
 
         def list_raw(d):
             return [f for f in os.listdir(d) if f.lower().endswith('.raw')]
 
-        # Index MA and GT by integer ID
-        ma_map, gt_map = {}, {}
+        # Build ID→filename maps
+        ma_map, gt_map, mask_map = {}, {}, {}
         for f in list_raw(ma_dir):
             m = ma_pat.match(f)
-            if m:
-                ma_map[int(m.group(1))] = f
+            if m: ma_map[int(m.group(1))] = f
         for f in list_raw(gt_dir):
             m = gt_pat.match(f)
-            if m:
-                gt_map[int(m.group(1))] = f
+            if m: gt_map[int(m.group(1))] = f
+        if mask_dir:
+            for f in list_raw(mask_dir):
+                m = mask_pat.match(f)
+                if m: mask_map[int(m.group(1))] = f
 
-        # Match by ID intersection
-        common_ids = sorted(set(ma_map).intersection(gt_map))
+        # Intersect IDs
+        common_ids = sorted(set(ma_map) & set(gt_map))
+        if mask_dir:
+            common_ids = sorted(set(common_ids) & set(mask_map))
+
         if not common_ids:
-            raise RuntimeError("No matched MA/GT pairs found. Check file names and directories.")
+            raise RuntimeError("No matched MA/GT (and mask) pairs found. Check names/dirs.")
 
-        pairs = [(ma_map[i], gt_map[i]) for i in common_ids]
+        # Build pair tuples
+        if mask_dir:
+            pairs = [(ma_map[i], gt_map[i], mask_map[i]) for i in common_ids]
+        else:
+            pairs = [(ma_map[i], gt_map[i]) for i in common_ids]
 
-        # Train/val/test split (reproducible)
-        train_val, test = train_test_split(pairs, test_size=test_size, random_state=seed, shuffle=True)
+        # Split (reproducible)
+        train_val, test = train_test_split(pairs, test_size=test_size,
+                                           random_state=seed, shuffle=True)
         eff_val = 0 if val_size == 0 else val_size / (1 - test_size)
         if eff_val > 0:
-            train, val = train_test_split(train_val, test_size=eff_val, random_state=seed, shuffle=True)
+            train, val = train_test_split(train_val, test_size=eff_val,
+                                          random_state=seed, shuffle=True)
         else:
             train, val = train_val, []
 
-        if split == 'train':
-            self.pairs = train
-        elif split == 'val':
-            self.pairs = val
-        else:
-            self.pairs = test
+        self.pairs_train = train
+        self.pairs_val   = val
+        self.pairs_test  = test
 
-        print(f"[CTDataset] MA-GT pairs: total={len(pairs)} | splits -> "
-              f"train={len(train)}, val={len(val)}, test={len(test)} | normalize={normalize}")
+        self.pairs = {'train': train, 'val': val, 'test': test}[split]
+
+        print(f"[CTDataset] total={len(pairs)} | train={len(train)} "
+              f"| val={len(val)} | test={len(test)} | window=[{self.hu_min}, {self.hu_max}]")
 
     def __len__(self):
         return len(self.pairs)
 
-    def _load_raw_img(self, path):
+    def _load_raw(self, path: str) -> np.ndarray:
         """Read .raw float32 file and reshape to (H,W)."""
         arr = np.fromfile(path, dtype=np.float32, count=self._numel)
         if arr.size != self._numel:
             raise ValueError(f"Unexpected file size for {path}. "
                              f"Expected {self._numel} float32 values, got {arr.size}.")
-        arr = arr.reshape(self.image_shape)
-        return arr
+        return arr.reshape(self.image_shape)
 
-    @staticmethod
-    def _minmax01(arr):
-        mn, mx = arr.min(), arr.max()
-        if mx > mn:
-            return (arr - mn) / (mx - mn)
-        return np.zeros_like(arr, dtype=np.float32)
+    def _clip_and_norm01(self, hu: np.ndarray) -> np.ndarray:
+        """Clip to [hu_min, hu_max] and map to [0,1]."""
+        hu = np.clip(hu, self.hu_min, self.hu_max)
+        return (hu - self.hu_min) / self._dr
 
-    def _apply_normalize(self, arr):
-        if self.normalize == 'none':
-            return arr
-        if self.normalize == 'per_image':
-            return self._minmax01(arr)
-        # global
-        out = (arr - self.global_min) / (self.global_max - self.global_min)
-        return np.clip(out, 0.0, 1.0)
+    def __getitem__(self, idx: int):
+        item = self.pairs[idx]
 
-    def __getitem__(self, idx):
-        ma_file, gt_file = self.pairs[idx]
+        if self.mask_dir:
+            ma_file, gt_file, mask_file = item
+            mask_path = os.path.join(self.mask_dir, mask_file)
+        else:
+            ma_file, gt_file = item
+            mask_path = None
 
         ma_path = os.path.join(self.ma_dir, ma_file)
         gt_path = os.path.join(self.gt_dir, gt_file)
 
-        ma = self._load_raw_img(ma_path).astype(np.float32)
-        gt = self._load_raw_img(gt_path).astype(np.float32)
+        # 1) Load raw HU
+        ma = self._load_raw(ma_path).astype(np.float32)
+        gt = self._load_raw(gt_path).astype(np.float32)
 
-        ma = self._apply_normalize(ma)
-        gt = self._apply_normalize(gt)
+        # 2) Clip to global HU window
+        # 3) Normalize to [0,1]
+        ma01 = self._clip_and_norm01(ma)
+        gt01 = self._clip_and_norm01(gt)
 
-        x = torch.from_numpy(np.expand_dims(ma, axis=0))  # (1,H,W)
-        y = torch.from_numpy(np.expand_dims(gt, axis=0))  # (1,H,W)
+        # To tensors (1,H,W)
+        x = torch.from_numpy(ma01).unsqueeze(0)  # (1,H,W), float32
+        y = torch.from_numpy(gt01).unsqueeze(0)  # (1,H,W), float32
+
+        # Optional mask (returned but NOT applied)
+        m = None
+        if mask_path:
+            mask_np = self._load_raw(mask_path).astype(np.float32)
+            # Ensure binary {0,1} if mask stored as 0/255 or HU-like:
+            if mask_np.max() > 1.0:
+                mask_np = (mask_np > 0).astype(np.float32)
+            m = torch.from_numpy(mask_np).unsqueeze(0)  # (1,H,W)
 
         if self.transform:
             x = self.transform(x)
             y = self.transform(y)
-        return x, y
+            if m is not None:
+                m = self.transform(m)
+
+        # Return without multiplying by mask (you’ll do it in metrics)
+        return (x, y, m) if m is not None else (x, y)
+
 
 
