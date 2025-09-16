@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from torch.utils.data import DataLoader
 from dataset import CTMetalArtifactDataset
 from utils import Logger
-from metrics import calculate_ssim, calculate_psnr
 from swin_unet.vision_transformer import SwinUnet   # assumes it reads config.MODEL.SWIN.IN_CHANS
 from unet import UnetGenerator                      # ensure it can take in_ch/input_nc if you use it
 import numpy as np
