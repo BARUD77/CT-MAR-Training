@@ -10,7 +10,8 @@ from metrics import calculate_ssim, calculate_psnr
 from swin_unet.vision_transformer import SwinUnet   # assumes it reads config.MODEL.SWIN.IN_CHANS
 from unet import UnetGenerator                      # ensure it can take in_ch/input_nc if you use it
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
+from metrics import compute_SSIM
+from metrics import compute_PSNR
 
 def dict_to_namespace(d):
     if isinstance(d, dict):
@@ -147,8 +148,8 @@ def main():
 
                 for i in range(pred_eval.size(0)):
                     # pass 2D tensors if your metric expects (H,W)
-                    total_ssim += ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
-                    total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
+                    total_ssim += compute_SSIM(pred_eval[i, 0], gt_eval[i, 0], data_range=1.0)
+                    total_psnr += compute_PSNR(pred_eval[i, 0], gt_eval[i, 0], data_range=1.0)
                     #total_ssim += ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
                     #total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
 
