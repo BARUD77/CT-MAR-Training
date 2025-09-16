@@ -597,23 +597,23 @@ class CTMetalArtifactDataset(Dataset):
         self._dr = self.hu_max - self.hu_min  # data_range for [0,1] mapping
 
         # filename patterns (adjust if yours differ)
-        ma_pat   = re.compile(r'^Input_Image_(\d+)_512x512(?:\.raw)?$',      re.IGNORECASE)
-        gt_pat   = re.compile(r'^Simulated_Image_(\d+)_512x512(?:\.raw)?$',  re.IGNORECASE)
+        ma_pat   = re.compile(r'^Input_Image_(\d+)_512x512(?:\.npy)?$',      re.IGNORECASE)
+        gt_pat   = re.compile(r'^Simulated_Image_(\d+)_512x512(?:\.npy)?$',  re.IGNORECASE)
         mask_pat = re.compile(r'^.*mask.*_(\d+)_512x512(?:\.raw)?$',         re.IGNORECASE)
 
-        def list_raw(d):
-            return [f for f in os.listdir(d) if f.lower().endswith('.raw')]
+        def list_npy(d):
+            return [f for f in os.listdir(d) if f.lower().endswith('.npy')]
 
         # Build ID→filename maps
         ma_map, gt_map, mask_map = {}, {}, {}
-        for f in list_raw(ma_dir):
+        for f in list_npy(ma_dir):
             m = ma_pat.match(f)
             if m: ma_map[int(m.group(1))] = f
-        for f in list_raw(gt_dir):
+        for f in list_npy(gt_dir):
             m = gt_pat.match(f)
             if m: gt_map[int(m.group(1))] = f
         if mask_dir:
-            for f in list_raw(mask_dir):
+            for f in list_npy(mask_dir):
                 m = mask_pat.match(f)
                 if m: mask_map[int(m.group(1))] = f
 
@@ -653,13 +653,9 @@ class CTMetalArtifactDataset(Dataset):
     def __len__(self):
         return len(self.pairs)
 
-    def _load_raw(self, path: str) -> np.ndarray:
+    def _load_npy(self, path: str) -> np.ndarray:
         """Read .raw float32 file and reshape to (H,W)."""
-        arr = np.fromfile(path, dtype=np.float32, count=self._numel)
-        if arr.size != self._numel:
-            raise ValueError(f"Unexpected file size for {path}. "
-                             f"Expected {self._numel} float32 values, got {arr.size}.")
-        return arr.reshape(self.image_shape)
+        arr = np.load(path)
 
     def _clip_and_norm01(self, hu: np.ndarray) -> np.ndarray:
         """Clip to [hu_min, hu_max] and map to [0,1]."""
@@ -680,8 +676,8 @@ class CTMetalArtifactDataset(Dataset):
         gt_path = os.path.join(self.gt_dir, gt_file)
 
         # 1) Load raw HU
-        ma = self._load_raw(ma_path).astype(np.float32)
-        gt = self._load_raw(gt_path).astype(np.float32)
+        ma = self._load_npy(ma_path)
+        gt = self._load_npy(gt_path)
 
         # 2) Clip to global HU window
         # 3) Normalize to [0,1]
@@ -695,7 +691,7 @@ class CTMetalArtifactDataset(Dataset):
         # Optional mask (returned but NOT applied)
         m = None
         if mask_path:
-            mask_np = self._load_raw(mask_path).astype(np.float32)
+            mask_np = self._load_npy(mask_path)
             # Ensure binary {0,1} if mask stored as 0/255 or HU-like:
             if mask_np.max() > 1.0:
                 mask_np = (mask_np > 0).astype(np.float32)
