@@ -656,6 +656,7 @@ class CTMetalArtifactDataset(Dataset):
     def _load_npy(self, path: str) -> np.ndarray:
         """Read .raw float32 file and reshape to (H,W)."""
         arr = np.load(path)
+        return arr
 
     def _clip_and_norm01(self, hu: np.ndarray) -> np.ndarray:
         """Clip to [hu_min, hu_max] and map to [0,1]."""
