@@ -147,8 +147,8 @@ def main():
 
                 for i in range(pred_eval.size(0)):
                     # pass 2D tensors if your metric expects (H,W)
-                    total_ssim += calculate_ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), datarange=1.0)
-                    total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), datarange=1.0)
+                    total_ssim += calculate_ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
+                    total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
                     #total_ssim += ssim(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
                     #total_psnr += calculate_psnr(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
 
