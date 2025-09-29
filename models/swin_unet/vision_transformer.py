@@ -17,7 +17,8 @@ from torch.nn.modules.utils import _pair
 from scipy import ndimage
 import sys
 sys.path.append("/content/drive/MyDrive/MAR/Pix2PIxGAN")
-from swin_unet.swin_transformer_unet_skip_expand_decoder_sys import SwinTransformerSys
+from .swin_transformer_unet_skip_expand_decoder_sys import SwinTransformerSys
+
 
 
 
