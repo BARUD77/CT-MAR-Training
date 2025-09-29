@@ -8,9 +8,8 @@ from types import SimpleNamespace
 from torch.utils.data import DataLoader
 
 from dataset import CTMetalArtifactDataset
-from models/swin_unet.vision_transformer import SwinUnet        # existing
-from unet import UnetGenerator                            # existing pix2pix-style
-from models/unet import UNet                               # <- the vanilla UNet I shared earlier
+from models.swin_unet.vision_transformer import SwinUnet
+from models.unet import UNet                               # <- the vanilla UNet I shared earlier
 
 import numpy as np
 from metrics import compute_SSIM, compute_PSNR
@@ -66,14 +65,14 @@ def build_model(name: str,
         )
         return m.to(device)
 
-    elif name in ("unetgen", "pix2pix_unet"):
-        # Your existing UnetGenerator (some repos call it with only in_ch, some without).
-        try:
-            m = UnetGenerator(in_ch=in_ch, **model_kwargs)
-        except TypeError:
-            # some versions ignore in_ch
-            m = UnetGenerator(**model_kwargs)
-        return m.to(device)
+    # elif name in ("unetgen", "pix2pix_unet"):
+    #     # Your existing UnetGenerator (some repos call it with only in_ch, some without).
+    #     try:
+    #         m = UnetGenerator(in_ch=in_ch, **model_kwargs)
+    #     except TypeError:
+    #         # some versions ignore in_ch
+    #         m = UnetGenerator(**model_kwargs)
+    #     return m.to(device)
 
     elif name in ("swinunet", "swin_unet", "swin-u"):
         if not model_cfg_path:
