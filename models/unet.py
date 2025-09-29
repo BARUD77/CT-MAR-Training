@@ -3,144 +3,83 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DoubleConv(nn.Module):
-    """
-    (Conv => BN => ReLU) x 2
-    """
-    def __init__(self, in_ch: int, out_ch: int, mid_ch: int | None = None):
+class EncoderBlock(nn.Module):
+    """Encoder block with optional BatchNorm"""
+    def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, padding=1, norm=True):
         super().__init__()
-        if mid_ch is None:
-            mid_ch = out_ch
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
+        layers = [
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        ]
+        if norm:
+            layers.append(nn.BatchNorm2d(out_channels))
+        self.block = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.block(x)
 
 
-class Down(nn.Module):
-    """
-    Downscaling with maxpool then double conv
-    """
-    def __init__(self, in_ch: int, out_ch: int):
+class DecoderBlock(nn.Module):
+    """Decoder block with optional Dropout"""
+    def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, padding=1, dropout=False):
         super().__init__()
-        self.pool_conv = nn.Sequential(
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            DoubleConv(in_ch, out_ch)
-        )
+        layers = [
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_channels)
+        ]
+        if dropout:
+            layers.append(nn.Dropout2d(p=0.5))
+        self.block = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pool_conv(x)
+    def forward(self, x):
+        return self.block(x)
 
 
-class Up(nn.Module):
-    """
-    Upscaling then double conv.
-    If bilinear=True, uses bilinear upsampling + 1x1 conv to reduce channels.
-    Else uses transposed convolution.
-    """
-    def __init__(self, in_ch: int, out_ch: int, bilinear: bool = False):
+class UnetGenerator(nn.Module):
+    """UNet-style encoder-decoder with skip connections"""
+    def __init__(self, in_channels=1, out_channels=1):
         super().__init__()
 
-        if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv = DoubleConv(in_ch, out_ch, mid_ch=in_ch // 2)
-        else:
-            self.up = nn.ConvTranspose2d(in_ch // 2, in_ch // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_ch, out_ch)
-
-        self.bilinear = bilinear
-
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        # x1: from previous layer (decoder), x2: skip connection (encoder)
-        if self.bilinear:
-            x1 = self.up(x1)
-        else:
-            # for transposed conv, reduce channels before upscaling
-            x1 = self.up(x1)
-
-        # pad x1 if needed to match x2 (handles odd sizes gracefully)
-        diff_y = x2.size(-2) - x1.size(-2)
-        diff_x = x2.size(-1) - x1.size(-1)
-        x1 = F.pad(x1, [diff_x // 2, diff_x - diff_x // 2,
-                        diff_y // 2, diff_y - diff_y // 2])
-
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
-
-
-class OutConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
-
-
-class UNet(nn.Module):
-    """
-    U-Net for 2D image segmentation.
-    Default config expects 1-channel 512x512 CT slices but works for any HxW divisible by 16.
-    """
-    def __init__(
-        self,
-        in_channels: int = 1,
-        num_classes: int = 1,
-        base_channels: int = 64,
-        bilinear: bool = False,
-    ):
-        super().__init__()
         # Encoder
-        self.inc = DoubleConv(in_channels, base_channels)
-        self.down1 = Down(base_channels, base_channels * 2)
-        self.down2 = Down(base_channels * 2, base_channels * 4)
-        self.down3 = Down(base_channels * 4, base_channels * 8)
-        factor = 2 if bilinear else 1
-        self.down4 = Down(base_channels * 8, (base_channels * 16) // factor)
+        self.enc1 = nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1)  # no norm
+        self.enc2 = EncoderBlock(64, 128)
+        self.enc3 = EncoderBlock(128, 256)
+        self.enc4 = EncoderBlock(256, 512)
+        self.enc5 = EncoderBlock(512, 512)
+        self.enc6 = EncoderBlock(512, 512)
+        self.enc7 = EncoderBlock(512, 512)
+        self.enc8 = EncoderBlock(512, 512, norm=False)
 
         # Decoder
-        self.up1 = Up(base_channels * 16, base_channels * 8 // factor, bilinear=bilinear)
-        self.up2 = Up(base_channels * 8, base_channels * 4 // factor, bilinear=bilinear)
-        self.up3 = Up(base_channels * 4, base_channels * 2 // factor, bilinear=bilinear)
-        self.up4 = Up(base_channels * 2, base_channels, bilinear=bilinear)
-        self.outc = OutConv(base_channels, num_classes)
+        self.dec8 = DecoderBlock(512, 512, dropout=True)
+        self.dec7 = DecoderBlock(1024, 512, dropout=True)
+        self.dec6 = DecoderBlock(1024, 512, dropout=True)
+        self.dec5 = DecoderBlock(1024, 512)
+        self.dec4 = DecoderBlock(1024, 256)
+        self.dec3 = DecoderBlock(512, 128)
+        self.dec2 = DecoderBlock(256, 64)
+        self.dec1 = nn.ConvTranspose2d(128, out_channels, kernel_size=4, stride=2, padding=1)
 
-        # Initialize weights
-        self._init_weights()
+    def forward(self, x):
+        # Encoding path
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
+        e5 = self.enc5(e4)
+        e6 = self.enc6(e5)
+        e7 = self.enc7(e6)
+        e8 = self.enc8(e7)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = self.inc(x)          # 1/1
-        x2 = self.down1(x1)       # 1/2
-        x3 = self.down2(x2)       # 1/4
-        x4 = self.down3(x3)       # 1/8
-        x5 = self.down4(x4)       # 1/16
+        # Decoding path with skip connections
+        d8 = self.dec8(e8)
+        d7 = self.dec7(torch.cat([d8, e7], dim=1))
+        d6 = self.dec6(torch.cat([d7, e6], dim=1))
+        d5 = self.dec5(torch.cat([d6, e5], dim=1))
+        d4 = self.dec4(torch.cat([d5, e4], dim=1))
+        d3 = self.dec3(torch.cat([d4, e3], dim=1))
+        d2 = self.dec2(torch.cat([d3, e2], dim=1))
+        d1 = self.dec1(torch.cat([d2, e1], dim=1))
 
-        x = self.up1(x5, x4)
-        x = self.up2(x,  x3)
-        x = self.up3(x,  x2)
-        x = self.up4(x,  x1)
-        logits = self.outc(x)
-        return logits
-
-    def _init_weights(self) -> None:
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if getattr(m, "bias", None) is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
-
-# Example:
-# model = UNet(in_channels=1, num_classes=1, base_channels=64, bilinear=False)
-# x = torch.randn(2, 1, 512, 512)
-# y = model(x)  # shape: (2, num_classes, 512, 512)
+        return torch.sigmoid(d1)
