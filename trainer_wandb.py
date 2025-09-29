@@ -58,8 +58,6 @@ def build_model(name: str,
         bilinear = bool(model_kwargs.pop("bilinear", False))
         m = UnetGenerator(
             in_channels=in_ch,
-            base_channels=base_channels,
-            bilinear=bilinear,
             **model_kwargs
         )
         return m.to(device)
