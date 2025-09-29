@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from dataset import CTMetalArtifactDataset
 from models.swin_unet.vision_transformer import SwinUnet
-from models.unet import UNet                               # <- the vanilla UNet I shared earlier
+from models.unet import UnetGenerator                               # <- the vanilla UNet I shared earlier
 
 import numpy as np
 from metrics import compute_SSIM, compute_PSNR
@@ -56,7 +56,7 @@ def build_model(name: str,
         # UNet uses explicit keyword args. We allow overrides from --model_kwargs.
         base_channels = int(model_kwargs.pop("base_channels", 64))
         bilinear = bool(model_kwargs.pop("bilinear", False))
-        m = UNet(
+        m = UnetGenerator(
             in_channels=in_ch,
             num_classes=num_classes,
             base_channels=base_channels,
