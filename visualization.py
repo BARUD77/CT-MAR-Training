@@ -12,7 +12,7 @@ import wandb
 # Your modules
 from dataset import CTMetalArtifactDataset
 from models.swin_unet.vision_transformer import SwinUnet
-from unet import UnetGenerator
+from models.unet import UnetGenerator
 from types import SimpleNamespace
 import yaml
 
@@ -69,7 +69,7 @@ def load_model(model_name, device, in_ch, config_path=None):
         except AttributeError:
             pass
         model = SwinUnet(config=cfg).to(device)
-    else:
+    elif model_name == 'unet':
         try:
             model = UnetGenerator(in_ch=in_ch).to(device)
         except TypeError:
