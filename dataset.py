@@ -39,7 +39,7 @@ class CTMetalArtifactDataset(Dataset):
         hu_max: float = 3072.0,
         transform=None,
         # --- head/body control ---
-        head_policy: str = "all",       # {"all","exclude","only"} -> all, body-only, head-only
+        head_policy: str = "exclude",       # {"all","exclude","only"} -> all, body-only, head-only
         id_max_body: int = 12374,       # IDs <= this are BODY; IDs > this are HEAD
     ):
         assert split in ('train', 'val'), "split must be 'train' or 'val'"
