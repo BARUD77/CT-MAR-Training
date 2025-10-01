@@ -45,7 +45,7 @@ def main():
     p.add_argument('--config', type=str, help='Path to config.yaml (required for swinunet)')
     p.add_argument('--ma_dir', type=str, required=True)
     p.add_argument('--gt_dir', type=str, required=True)
-    p.add_argument('--split', type=str, choices=['val','test'], default='val')
+    p.add_argument('--split', type=str, choices=['val','test'], default='train')
     p.add_argument('--batch_size', type=int, default=4)
     p.add_argument('--ckpt', type=str, required=True, help='Path to .pt checkpoint saved during training')
     p.add_argument('--project', type=str, default=None, help='W&B project (optional)')
