@@ -61,8 +61,8 @@ class CTMetalArtifactDataset(Dataset):
 
         # Filename patterns (adjust if yours differ)
         # Example: Input_Image_123_512x512.npy  /  Simulated_Image_123_512x512.npy
-        ma_pat   = re.compile(r'^test_body_metalart_img(\d+)_\d+x\d+(?:\.npy)?$',      re.IGNORECASE)
-        gt_pat   = re.compile(r'^test_body_nometal_img(\d+)_\d+x\d+(?:\.npy)?$',  re.IGNORECASE)
+        ma_pat   = re.compile(r'^test_body_metalart_img(\d+)_\d+x\d+x1(?:\.npy)?$',      re.IGNORECASE)
+        gt_pat   = re.compile(r'^test_body_nometal_img(\d+)_\d+x\d+x1(?:\.npy)?$',  re.IGNORECASE)
         mask_pat = re.compile(r'^.*mask.*_(\d+)_\d+x\d+(?:\.npy)?$',         re.IGNORECASE)
 
         def list_npy(d):
