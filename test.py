@@ -4,7 +4,7 @@ import torch
 import yaml
 from types import SimpleNamespace
 from torch.utils.data import DataLoader
-from dataset import CTMetalArtifactDataset
+from test_dataset import CTMetalArtifactDataset
 from models.swin_unet.vision_transformer import SwinUnet
 from unet import UnetGenerator
 from metrics import compute_SSIM, compute_PSNR
