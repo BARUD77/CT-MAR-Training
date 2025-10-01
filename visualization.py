@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import wandb
 
 # Your modules
-from dataset import CTMetalArtifactDataset
+from test_dataset import CTMetalArtifactDataset
 from models.swin_unet.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
 from types import SimpleNamespace
