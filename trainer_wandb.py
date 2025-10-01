@@ -157,13 +157,13 @@ def main():
     train_ds = CTMetalArtifactDataset(
         ma_dir=args.ma_dir, gt_dir=args.gt_dir, mask_dir=None,
         split='train', hu_min=HU_MIN, hu_max=HU_MAX, 
-        head_policy="exclude"  # hardcoding to body-only
+        head_policy="exclude",  # hardcoding to body-only
         seed=42, val_size=0.1
     )
     val_ds = CTMetalArtifactDataset(
         ma_dir=args.ma_dir, gt_dir=args.gt_dir, mask_dir=None,
         split='val', hu_min=HU_MIN, hu_max=HU_MAX, 
-        head_policy="exclude"  # hardcoding to body-only
+        head_policy="exclude",  # hardcoding to body-only
         seed=42, val_size=0.1
     )
 
