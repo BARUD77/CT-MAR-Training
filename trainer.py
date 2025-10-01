@@ -36,6 +36,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=2e-4)
     parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
     parser.add_argument('--logger_name', type=str, default='training_log')
+    #parser.add_argument('--head_policy', type=str, choices=['all', 'exclude', 'only'], default='all',)
     args = parser.parse_args()
 
     # Validate LI path only when needed
@@ -74,7 +75,10 @@ def main():
         mask_dir=None,              # or provide path if you have masks
         split='train',
         hu_min=HU_MIN,
-        hu_max=HU_MAX
+        hu_max=HU_MAX,
+        head_policy="exclude",      # "all","exclude","only"
+        id_max_body=12374           # IDs <= this are BODY; > this are HEAD
+        val_size=0.1, seed=42
     )
 
     val_ds = CTMetalArtifactDataset(
@@ -83,13 +87,11 @@ def main():
         mask_dir=None,              # or provide mask path
         split='val',
         hu_min=HU_MIN,
-        hu_max=HU_MAX
+        hu_max=HU_MAX,
+        head_policy="exclude",      # "all","exclude","only"
+        id_max_body=12374,           # IDs <= this are BODY; > this are HEAD
+        val_size=0.1, seed=42
     )
-
-    # Sanity check
-    # after you created val_ds = CTMetalArtifactDataset(...)
-
-    val_loader1 = DataLoader(val_ds, batch_size=1, shuffle=False)
 
 
 
