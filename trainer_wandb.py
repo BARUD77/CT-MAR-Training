@@ -87,7 +87,19 @@ def build_model(name: str,
     else:
         raise ValueError(f"Unknown model: {name}. Supported: unet, unetgen, swinunet")
 
-
+def param_groups(model, wd, nowd_names=('bias', 'bn', 'norm')):
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(k in n.lower() for k in nowd_names):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {'params': decay, 'weight_decay': wd},
+        {'params': no_decay, 'weight_decay': 0.0},
+    ]
 # ----------------------------- Main -----------------------------
 def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
@@ -111,7 +123,7 @@ def main():
     parser.add_argument('--num_classes', type=int, default=1, help='Output channels/classes')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--learning_rate', type=float, default=2e-4)
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
     parser.add_argument('--run_name', type=str, default=None, help='W&B run name')
     parser.add_argument('--project', type=str, default='ct-mar', help='W&B project name')
@@ -174,7 +186,13 @@ def main():
     print(f"Training on {len(train_ds)} samples, validating on {len(val_ds)} samples.")
 
     # ---------------- Optimizer / loss ----------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    import torch, itertools as it
+
+
+
+    optimizer = torch.optim.AdamW(param_groups(model, wd=1e-4),
+                              lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8)
+
     loss_fn = torch.nn.L1Loss()
 
     best_ssim = -1.0
