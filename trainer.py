@@ -22,6 +22,9 @@ def load_config(config_path):
         cfg_dict = yaml.safe_load(f)
     return dict_to_namespace(cfg_dict)
 
+def sum(a, b):
+    return a + b
+
 def main():
     parser = argparse.ArgumentParser(description="Training script")
     parser.add_argument('--model', type=str, choices=['unet', 'swinunet'], required=True)
