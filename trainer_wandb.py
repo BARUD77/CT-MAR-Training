@@ -577,17 +577,18 @@ def main():
         print(f"[Epoch {epoch}] Loss: {avg_loss:.4f} PSNR: {avg_psnr:.2f} SSIM: {avg_ssim:.4f}")
 
         # ---------------- Save checkpoints ----------------
-        ckpt_name = f"{args.model}_epoch{epoch:03d}.pt"
-        ckpt_path = os.path.join(args.log_dir, ckpt_name)
-        torch.save({"epoch": epoch, "model_state": model.state_dict()}, ckpt_path)
+        # Save only a rolling "last.pt" (overwritten every epoch)
+        last_ckpt_path = os.path.join(args.log_dir, "last.pt")
+        torch.save({"epoch": epoch, "model_state": model.state_dict()}, last_ckpt_path)
 
+        # Upload/update "last" artifact each epoch (creates versions in W&B)
         last_art = wandb.Artifact(f"{args.model}-last", type="model")
-        last_art.add_file(ckpt_path)
+        last_art.add_file(last_ckpt_path)
         wandb.log_artifact(last_art, aliases=["latest"])
 
         if avg_ssim > best_ssim:
             best_ssim = avg_ssim
-            best_ckpt_path = os.path.join(args.log_dir, f"{args.model}_best.pt")
+            best_ckpt_path = os.path.join(args.log_dir, "best.pt")
             torch.save({"epoch": epoch, "model_state": model.state_dict()}, best_ckpt_path)
             best_art = wandb.Artifact(f"{args.model}-best", type="model")
             best_art.add_file(best_ckpt_path)
