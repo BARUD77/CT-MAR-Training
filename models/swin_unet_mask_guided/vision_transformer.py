@@ -52,8 +52,9 @@ class SwinUnet(nn.Module):
         x: image tensor (B, C, H, W)
         artifact_map: optional A_MG (B,1,H,W) or (B,H,W)
         """
-        if x.size()[1] == 1:
-            x = x.repeat(1,3,1,1)
+        # Keep channel count consistent with config.MODEL.SWIN.IN_CHANS.
+        # For this project we set IN_CHANS=1, so do NOT repeat 1->3.
+        # If you ever switch to IN_CHANS=3, provide 3-channel input upstream.
 
         # Pass artifact_map through unchanged; SwinTransformerSys will resize per stage
         logits = self.swin_unet(x, artifact_map=artifact_map)

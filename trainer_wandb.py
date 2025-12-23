@@ -498,8 +498,10 @@ def main():
                 # SwinUnet accepts (x, artifact_map=...) in our patched implementation.
                 # Ensure we pass MA-only as input (x_batch should be single channel).
                 if args.input_mode == 'ma_li':
-                    # x_batch is MA (1,ch), li_batch is the guidance A_MG
-                    pred = model(x_batch, artifact_map=li_batch)
+                    # Compute soft artifact map: A_MG = MA - LI (both in [0,1] normalized space)
+                    # Shapes: x_batch (B,1,H,W), li_batch (B,1,H,W)
+                    artifact_map = x_batch - li_batch
+                    pred = model(x_batch, artifact_map=artifact_map)
                 else:
                     pred = model(x_batch, artifact_map=None)
             else:
@@ -537,7 +539,8 @@ def main():
 
                 if args.model.lower() in ("swinunet",):
                     if li_batch is not None:
-                        pred = model(x_batch, artifact_map=li_batch)
+                        artifact_map = x_batch - li_batch
+                        pred = model(x_batch, artifact_map=artifact_map)
                     else:
                         pred = model(x_batch, artifact_map=None)
                 else:
