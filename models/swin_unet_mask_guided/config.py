@@ -73,6 +73,12 @@ _C.MODEL.SWIN.QK_SCALE = None
 _C.MODEL.SWIN.APE = False
 _C.MODEL.SWIN.PATCH_NORM = True
 _C.MODEL.SWIN.FINAL_UPSAMPLE= "expand_first"
+# Whether to use a soft artifact map (A_MG = ma - li) as guidance
+_C.MODEL.SWIN.ARTIFACT_GUIDED = False
+# Number of channels in the artifact map (usually 1)
+_C.MODEL.SWIN.ARTIFACT_MAP_CHANNELS = 1
+# Scale applied to the artifact map when injecting into attention (metal bias scale)
+_C.MODEL.SWIN.ARTIFACT_SCALE = 1.0
 
 # -----------------------------------------------------------------------------
 # Training settings
