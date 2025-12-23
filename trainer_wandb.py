@@ -498,9 +498,14 @@ def main():
                 # SwinUnet accepts (x, artifact_map=...) in our patched implementation.
                 # Ensure we pass MA-only as input (x_batch should be single channel).
                 if args.input_mode == 'ma_li':
-                    # Compute soft artifact map: A_MG = MA - LI (both in [0,1] normalized space)
+                    # Compute soft artifact map per paper:
+                    #   A_MG = max(x_LI - x_MA, 0)
+                    # then normalize A_MG to [0,1].
                     # Shapes: x_batch (B,1,H,W), li_batch (B,1,H,W)
-                    artifact_map = x_batch - li_batch
+                    artifact_map = torch.relu(li_batch - x_batch)
+                    eps = 1e-6
+                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                    artifact_map = artifact_map / (am_max + eps)
                     pred = model(x_batch, artifact_map=artifact_map)
                 else:
                     pred = model(x_batch, artifact_map=None)
@@ -539,7 +544,10 @@ def main():
 
                 if args.model.lower() in ("swinunet",):
                     if li_batch is not None:
-                        artifact_map = x_batch - li_batch
+                        artifact_map = torch.relu(li_batch - x_batch)
+                        eps = 1e-6
+                        am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                        artifact_map = artifact_map / (am_max + eps)
                         pred = model(x_batch, artifact_map=artifact_map)
                     else:
                         pred = model(x_batch, artifact_map=None)
