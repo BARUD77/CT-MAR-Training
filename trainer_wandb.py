@@ -285,8 +285,8 @@ from types import SimpleNamespace
 from torch.utils.data import DataLoader
 
 # NOTE: import path must match your repo layout
-from ct_mar_dataset import CTMetalArtifactDataset   # patched dataset that returns (x, y, li)
-from models.swin_unet.vision_transformer import SwinUnet
+from aapm_dataset import CTMetalArtifactDataset   # patched dataset that returns (x, y, li)
+from models.swin_unet_mask_guided.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
 
 import numpy as np
