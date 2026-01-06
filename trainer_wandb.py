@@ -399,6 +399,10 @@ def main():
     parser.add_argument('--region_policy', type=str, default='all', choices=['all','body','head'],
                         help='Region filter passed to dataset (defaults to "all").')
 
+    # Intensity window (HU) used for clipping/normalization inside the dataset
+    parser.add_argument('--hu_min', type=float, default=-1024.0, help='Minimum HU for clipping before normalization')
+    parser.add_argument('--hu_max', type=float, default=3072.0, help='Maximum HU for clipping before normalization')
+
     args = parser.parse_args()
 
     # Validate LI path when input_mode=ma_li
@@ -443,7 +447,6 @@ def main():
     wandb.watch(model, log='gradients', log_freq=100)
 
     # ---------------- Dataset / loaders ----------------
-    HU_MIN, HU_MAX = -1024.0, 3072.0
 
     # Our CTMetalArtifactDataset (patched) requires li_dir when we want LI returned.
     # If input_mode == 'ma_li' we will request li_dir to be used.
@@ -452,8 +455,8 @@ def main():
         gt_dir=args.gt_dir,
         li_dir=args.li_dir if args.input_mode == 'ma_li' else None,
         split='train',
-        hu_min=HU_MIN,
-        hu_max=HU_MAX,
+        hu_min=float(args.hu_min),
+        hu_max=float(args.hu_max),
         region_policy=args.region_policy,
         seed=42,
         val_size=0.1
