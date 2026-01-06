@@ -342,6 +342,13 @@ def build_model(name: str,
         except Exception:
             # ignore if config layout differs
             pass
+
+        # Ensure output channels match training target.
+        # The mask-guided SwinUnet wrapper defaults num_classes=21843, which will OOM for 512x512.
+        # Prefer CLI --num_classes unless user explicitly overrides via --model_kwargs.
+        if "num_classes" not in model_kwargs:
+            model_kwargs["num_classes"] = int(num_classes)
+
         m = SwinUnet(config=cfg_ns, **model_kwargs)
         return m.to(device)
     else:
