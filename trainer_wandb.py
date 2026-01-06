@@ -290,7 +290,7 @@ from models.swin_unet_mask_guided.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
 
 import numpy as np
-from metrics import compute_SSIM, compute_PSNR
+from metrics import compute_SSIM, compute_PSNR, compute_RMSE
 import wandb
 
 # ----------------------------- Utilities -----------------------------
@@ -536,6 +536,7 @@ def main():
         model.eval()
         total_ssim = 0.0
         total_psnr = 0.0
+        total_rmse = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 if args.input_mode == 'ma_li':
@@ -572,16 +573,18 @@ def main():
                 for i in range(pred_eval.size(0)):
                     total_ssim += compute_SSIM(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
                     total_psnr += compute_PSNR(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
+                    total_rmse += compute_RMSE(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
 
         avg_psnr = total_psnr / len(val_ds)
         avg_ssim = total_ssim / len(val_ds)
+        avg_rmse = total_rmse / len(val_ds)
 
         # ---------------- Log to W&B ----------------
         wandb.log(
-            {"loss": avg_loss, "psnr": avg_psnr, "ssim": avg_ssim, "epoch": epoch},
+            {"loss": avg_loss, "psnr": avg_psnr, "ssim": avg_ssim, "rmse": avg_rmse, "epoch": epoch},
             step=epoch
         )
-        print(f"[Epoch {epoch}] Loss: {avg_loss:.4f} PSNR: {avg_psnr:.2f} SSIM: {avg_ssim:.4f}")
+        print(f"[Epoch {epoch}] Loss: {avg_loss:.4f} PSNR: {avg_psnr:.2f} SSIM: {avg_ssim:.4f} RMSE: {avg_rmse:.4f}")
 
         # ---------------- Save checkpoints ----------------
         # Save only a rolling "last.pt" (overwritten every epoch)
