@@ -224,7 +224,7 @@ class CTMetalArtifactDataset(Dataset):
         # region filter: "all" (default), "body" (only body), "head" (only head)
         region_policy: str = "all",
     ):
-        assert split in {"train", "val"}
+        assert split in {"train", "val", "test"}
         assert 0.0 <= val_size < 1.0
         assert hu_max > hu_min
         assert region_policy in {"all", "body", "head"}
@@ -288,13 +288,16 @@ class CTMetalArtifactDataset(Dataset):
         for key in keys:
             triplets_all.append((ma_map[key], gt_map[key], li_map[key]))
 
-        # Train/Val split
-        if val_size > 0:
-            train, val = train_test_split(triplets_all, test_size=val_size, random_state=seed, shuffle=True)
+        # Train/Val split (test uses the full set)
+        if split == "test":
+            train, val = [], []
+            self.pairs = triplets_all
         else:
-            train, val = triplets_all, []
-
-        self.pairs = {"train": train, "val": val}[split]
+            if val_size > 0:
+                train, val = train_test_split(triplets_all, test_size=val_size, random_state=seed, shuffle=True)
+            else:
+                train, val = triplets_all, []
+            self.pairs = {"train": train, "val": val}[split]
         self._ma_map, self._gt_map, self._li_map = ma_map, gt_map, li_map
         self._keys = keys
         self.region_policy = region_policy
