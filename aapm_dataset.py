@@ -239,8 +239,9 @@ class CTMetalArtifactDataset(Dataset):
 
         # Regex for your filenames
         # training_{region}_{kind}_img{ID}_{HxWxZ}.npy
+        # Accept either training_ or test_ prefixes (e.g. training_body_... or test_body_...)
         rx = re.compile(
-            r'^training_(body|head)_(metalart|nometal|li)_img(\d+)_\d+x\d+x\d+(?:\.npy)?$',
+            r'^(?:training|test)_(body|head)_(metalart|nometal|li)_img(\d+)_\d+x\d+x\d+(?:\.npy)?$',
             re.IGNORECASE
         )
 
