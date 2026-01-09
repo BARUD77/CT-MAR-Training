@@ -68,13 +68,83 @@ def load_model(model_name, device, in_ch, config_path=None):
             cfg.MODEL.SWIN.IN_CHANS = in_ch
         except AttributeError:
             pass
-        model = SwinUnet(config=cfg).to(device)
+        # Ensure the network head produces a single-channel output for CT
+        try:
+            cfg.MODEL.SWIN.NUM_CLASSES = 1
+        except AttributeError:
+            # If cfg structure differs, fall back to passing num_classes explicitly
+            pass
+        model = SwinUnet(config=cfg, num_classes=1).to(device)
     elif model_name == 'unet':
         try:
             model = UnetGenerator(in_ch=in_ch).to(device)
         except TypeError:
             model = UnetGenerator().to(device)
     return model
+
+
+def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device):
+    """
+    Robust checkpoint loader: accepts checkpoints saved as raw state_dict, or dicts
+    containing keys like 'model_state', 'state_dict', or 'model'. Removes common
+    'module.' prefixes, and falls back to strict=False or partial key copying.
+    """
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # extract candidate state dict
+    state = None
+    if isinstance(ckpt, dict):
+        for k in ("model_state", "state_dict", "model", "state"):
+            if k in ckpt:
+                state = ckpt[k]
+                break
+    if state is None:
+        state = ckpt
+
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Unsupported checkpoint format: {type(state)}")
+
+    # strip 'module.' prefix if present
+    def _strip_module(d):
+        if any(k.startswith("module.") for k in d.keys()):
+            return {k.replace("module.", ""): v for k, v in d.items()}
+        return d
+
+    sd = _strip_module(state)
+
+    # Try direct load
+    try:
+        model.load_state_dict(sd)
+        print("Checkpoint loaded (exact match).")
+        return
+    except Exception as e:
+        print(f"Exact load failed: {e}")
+
+    # Try strict=False
+    try:
+        model.load_state_dict(sd, strict=False)
+        print("Checkpoint loaded with strict=False (partial match).")
+        return
+    except Exception as e:
+        print(f"Load with strict=False failed: {e}")
+
+    # If model contains a wrapped attribute (e.g., model.swin_unet), try loading into that
+    if hasattr(model, "swin_unet") and isinstance(sd, dict):
+        try:
+            model.swin_unet.load_state_dict(sd, strict=False)
+            print("Loaded checkpoint into model.swin_unet with strict=False.")
+            return
+        except Exception as e:
+            print(f"Loading into model.swin_unet failed: {e}")
+
+    # As last resort, copy all compatible keys
+    model_dict = model.state_dict()
+    compatible = {k: v for k, v in sd.items() if k in model_dict and v.shape == model_dict[k].shape}
+    if not compatible:
+        raise RuntimeError("No compatible parameter shapes found in checkpoint to partially load.")
+    model_dict.update(compatible)
+    model.load_state_dict(model_dict)
+    print(f"Partially loaded checkpoint ({len(compatible)} keys matched by shape).")
 
 # ------------------------
 # Main
@@ -160,9 +230,11 @@ def main():
         # load model
         model = load_model(args.model, device, in_ch=args.in_ch, config_path=args.config)
         if args.ckpt:
-            ckpt = torch.load(args.ckpt, map_location=device)
-            state = ckpt.get('model_state', ckpt)
-            model.load_state_dict(state)
+            try:
+                load_checkpoint(model, args.ckpt, device)
+            except Exception as e:
+                print(f"Failed to load checkpoint {args.ckpt}: {e}")
+                raise
         model.eval()
 
         saved = 0
