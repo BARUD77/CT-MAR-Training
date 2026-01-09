@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 import wandb
 
 # Your modules
-from test_dataset import CTMetalArtifactDataset
-from models.swin_unet.vision_transformer import SwinUnet
+from test_dataset import CTMetalArtifactDataset as CTDatasetLegacy
+from models.swin_unet_mask_guided.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
 from types import SimpleNamespace
 import yaml
@@ -87,6 +87,7 @@ def main():
     p.add_argument('--split', choices=['train','val','test'], default='val')
     p.add_argument('--ma_dir', type=str, help='Required if mode=from_model', default=None)
     p.add_argument('--gt_dir', type=str, help='Required if mode=from_model', default=None)
+    p.add_argument('--li_dir', type=str, default=None, help='LI directory (optional). If provided, uses aapm_dataset with LI support')
     p.add_argument('--mask_dir', type=str, default=None)
     p.add_argument('--batch_size', type=int, default=4)
     p.add_argument('--num_samples', type=int, default=15, help='Number of random samples to visualize')
@@ -131,10 +132,20 @@ def main():
             raise ValueError("--ma_dir and --gt_dir are required for mode=from_model")
 
         # dataset returns normalized [0,1] tensors (1,H,W)
-        ds_full = CTMetalArtifactDataset(
-            ma_dir=args.ma_dir, gt_dir=args.gt_dir, mask_dir=args.mask_dir,
-            split=args.split, hu_min=args.hu_min, hu_max=args.hu_max
-        )
+        # If LI guidance is provided, prefer the aapm_dataset that returns (x,y,li)
+        if args.li_dir is not None:
+            from aapm_dataset import CTMetalArtifactDataset
+            ds_full = CTMetalArtifactDataset(
+                ma_dir=args.ma_dir, gt_dir=args.gt_dir, li_dir=args.li_dir,
+                split=args.split, hu_min=args.hu_min, hu_max=args.hu_max
+            )
+        else:
+            # legacy dataset returning (x,y) or (x,y,mask)
+            CTMetalArtifactDataset = CTDatasetLegacy
+            ds_full = CTMetalArtifactDataset(
+                ma_dir=args.ma_dir, gt_dir=args.gt_dir, mask_dir=args.mask_dir,
+                split=args.split, hu_min=args.hu_min, hu_max=args.hu_max
+            )
 
         # --- Random, reproducible subset of size K ---
         k = min(args.num_samples, len(ds_full))
@@ -157,16 +168,34 @@ def main():
         saved = 0
         with torch.no_grad():
             for batch_idx, batch in enumerate(loader):
-                # dataset may return (x,y) or (x,y,m)
+                # dataset may return (x,y), (x,y,mask) or (x,y,li)
+                li = None
                 if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                    x, y, _ = batch
+                    x, y, third = batch
+                    # If user provided --li_dir we expect the third element to be LI
+                    if args.li_dir is not None:
+                        x, y, li = x, y, third
+                    else:
+                        x, y = x, y
                 else:
                     x, y = batch
 
                 x = x.to(device, non_blocking=True)   # (B,1,H,W)
                 y = y.to(device, non_blocking=True)
 
-                pred = model(x)
+                # If using swinunet + LI guidance, compute artifact_map from (li - ma)
+                if args.model == 'swinunet' and li is not None:
+                    li = li.to(device, non_blocking=True)
+                    artifact_map = torch.relu(li - x)
+                    # normalize per-sample to [0,1] (avoid division by zero)
+                    B = artifact_map.size(0)
+                    for ii in range(B):
+                        mmax = float(artifact_map[ii].max())
+                        if mmax > 0:
+                            artifact_map[ii] = artifact_map[ii] / mmax
+                    pred = model(x, artifact_map=artifact_map)
+                else:
+                    pred = model(x)
                 pred_eval = torch.clamp(pred, 0, 1)   # ensure [0,1]
                 gt_eval   = torch.clamp(y,   0, 1)
 
