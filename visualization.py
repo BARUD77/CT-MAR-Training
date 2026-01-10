@@ -1,4 +1,4 @@
-import argparse
+import argparse 
 import os
 from pathlib import Path
 import numpy as np
@@ -38,9 +38,30 @@ def to_numpy_image(t: torch.Tensor):
         t = t[0]
     return t.detach().cpu().float().clamp(0,1).numpy()
 
+def hu_from_normalized(img01, hu_min, hu_max):
+    """
+    img01: numpy array in [0,1]
+    Returns HU values as numpy array
+    """
+    return hu_min + img01 * (hu_max - hu_min)
+
+def apply_window_normalized(img01, hu_min, hu_max, level=40.0, width=400.0):
+    """
+    Apply CT windowing to an image that is currently normalized to [0,1]
+    Returns an image normalized to [0,1] for display:
+      0 maps to (level - width/2), 1 maps to (level + width/2)
+    """
+    hu = hu_from_normalized(img01, hu_min, hu_max)
+    low = level - width / 2.0
+    high = level + width / 2.0
+    hu_clipped = np.clip(hu, low, high)
+    # Map clipped HU back to [0,1] for display
+    disp = (hu_clipped - low) / (high - low)
+    return np.clip(disp, 0.0, 1.0)
+
 def save_triptych(ma, pr, gt, out_path, suptitle=None, cmap='gray'):
     """
-    ma, pr, gt: numpy arrays (H,W) in [0,1]
+    ma, pr, gt: numpy arrays (H,W) in [0,1] (already windowed)
     """
     H, W = ma.shape
     fig = plt.figure(figsize=(12, 4), dpi=150)
@@ -174,9 +195,13 @@ def main():
     p.add_argument('--npy_pred_glob', type=str, default=None, help='Glob for Pred npy files, e.g. ./eval_outputs/*_pred.npy')
     p.add_argument('--npy_gt_glob', type=str, default=None, help='Glob for GT npy files, e.g. ./eval_outputs/*_gt.npy')
 
-    # HU window (dataset assumed to output [0,1] already; HU range here only for metadata/logging)
+    # HU range (dataset assumed to output [0,1] already mapped from hu_min..hu_max)
     p.add_argument('--hu_min', type=float, default=-1024.0)
     p.add_argument('--hu_max', type=float, default=3072.0)
+
+    # Window/Level for visualization
+    p.add_argument('--win_level', type=float, default=40.0, help='Window level (HU) for visualization, e.g. 40')
+    p.add_argument('--win_width', type=float, default=400.0, help='Window width (HU) for visualization, e.g. 400')
 
     # Output / W&B
     p.add_argument('--out_dir', type=str, default='./viz_triptychs')
@@ -196,6 +221,17 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rng = np.random.default_rng(args.seed)
+
+    # helper to apply windowing before saving
+    def window_and_save(ma01, pr01, gt01, out_path, suptitle):
+        """
+        Inputs ma01/pr01/gt01 are numpy arrays in [0,1] returned by dataset/model.
+        This function applies HU mapping and windowing and then saves.
+        """
+        ma_w = apply_window_normalized(ma01, args.hu_min, args.hu_max, level=args.win_level, width=args.win_width)
+        pr_w = apply_window_normalized(pr01, args.hu_min, args.hu_max, level=args.win_level, width=args.win_width)
+        gt_w = apply_window_normalized(gt01, args.hu_min, args.hu_max, level=args.win_level, width=args.win_width)
+        save_triptych(ma_w, pr_w, gt_w, out_path, suptitle=suptitle)
 
     if args.mode == 'from_model':
         if args.ma_dir is None or args.gt_dir is None:
@@ -282,7 +318,7 @@ def main():
 
                     # Use saved as the rank; optionally include source index
                     png_path = out_dir / f"{args.split}_rand_idx_{saved:05d}.png"
-                    save_triptych(ma_np, pr_np, gt_np, png_path,
+                    window_and_save(ma_np, pr_np, gt_np, png_path,
                                   suptitle=f"{args.split} rand#{saved}")
 
                     if args.log_to_wandb and args.project:
@@ -326,7 +362,7 @@ def main():
             gt_np = np.clip(gt_np, 0, 1)
 
             png_path = out_dir / f"npy_rand_{rank:02d}_src_{idx:05d}.png"
-            save_triptych(ma_np, pr_np, gt_np, png_path, suptitle=f"sample {idx}")
+            window_and_save(ma_np, pr_np, gt_np, png_path, suptitle=f"sample {idx}")
             if args.log_to_wandb and args.project:
                 wandb.log({
                     "triptych": wandb.Image(png_path, caption=f"npy sample {idx}")
