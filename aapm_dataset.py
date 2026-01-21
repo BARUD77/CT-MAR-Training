@@ -214,6 +214,7 @@ class CTMetalArtifactDataset(Dataset):
         ma_dir: str,
         gt_dir: str,
         li_dir: str,
+        mask_dir: str | None = None,
         split: str = "train",          # {"train","val"}
         val_size: float = 0.1,
         seed: int = 42,
@@ -241,7 +242,7 @@ class CTMetalArtifactDataset(Dataset):
         # training_{region}_{kind}_img{ID}_{HxWxZ}.npy
         # Accept either training_ or test_ prefixes (e.g. training_body_... or test_body_...)
         rx = re.compile(
-            r'^(?:training|test)_(body|head)_(metalart|nometal|li)_img(\d+)_\d+x\d+x\d+(?:\.npy)?$',
+            r'^(?:training|test)_(body|head)_(metalart|nometal|li|metalonlymask)_img(\d+)_\d+x\d+x\d+(?:\.npy)?$',
             re.IGNORECASE
         )
 
@@ -252,7 +253,7 @@ class CTMetalArtifactDataset(Dataset):
             return [f for f in os.listdir(d) if f.lower().endswith(".npy") or rx.match(f)]
 
         # Build maps keyed by (region, id)
-        ma_map, gt_map, li_map = {}, {}, {}
+        ma_map, gt_map, li_map, mask_map = {}, {}, {}, {}
 
         for f in list_npy(ma_dir):
             m = rx.match(f)
@@ -272,8 +273,19 @@ class CTMetalArtifactDataset(Dataset):
                 key = (m.group(1).lower(), int(m.group(3)))
                 li_map[key] = f
 
+        # optional metal-only masks
+        if mask_dir is not None:
+            for f in list_npy(mask_dir):
+                m = rx.match(f)
+                if m and m.group(2).lower() == "metalonlymask":
+                    key = (m.group(1).lower(), int(m.group(3)))
+                    mask_map[key] = f
+
         # Intersect keys present in required modalities (MA, GT, LI)
         keys = sorted(set(ma_map) & set(gt_map) & set(li_map))
+        # If mask_dir provided, require mask to be present as well
+        if mask_dir is not None:
+            keys = sorted(set(keys) & set(mask_map))
 
         if not keys:
             raise RuntimeError("No matched MA/GT/LI triplets. Check dirs/filenames.")
@@ -284,10 +296,14 @@ class CTMetalArtifactDataset(Dataset):
             if not keys:
                 raise RuntimeError(f"No pairs after region_policy='{region_policy}' filter.")
 
-        # Build file tuples (MA, GT, LI)
+        # Build file tuples. If mask present we insert mask before LI so
+        # tuples become (MA, GT, MASK, LI) which keeps LI as last element.
         triplets_all = []
         for key in keys:
-            triplets_all.append((ma_map[key], gt_map[key], li_map[key]))
+            if mask_dir is not None:
+                triplets_all.append((ma_map[key], gt_map[key], mask_map[key], li_map[key]))
+            else:
+                triplets_all.append((ma_map[key], gt_map[key], li_map[key]))
 
         # Train/Val split (test uses the full set)
         if split == "test":
@@ -325,6 +341,13 @@ class CTMetalArtifactDataset(Dataset):
     def __getitem__(self, idx: int):
         ma_file, gt_file, li_file = self.pairs[idx]
 
+        # Support pairs of length 3: (ma, gt, li) and length 4: (ma, gt, mask, li)
+        if len(self.pairs[idx]) == 3:
+            ma_file, gt_file, li_file = self.pairs[idx]
+            mask_file = None
+        else:
+            ma_file, gt_file, mask_file, li_file = self.pairs[idx]
+
         ma = self._clip_and_norm01(self._load_npy(os.path.join(self.ma_dir, ma_file)))
         gt = self._clip_and_norm01(self._load_npy(os.path.join(self.gt_dir, gt_file)))
         li = self._clip_and_norm01(self._load_npy(os.path.join(self.li_dir, li_file)))
@@ -333,11 +356,23 @@ class CTMetalArtifactDataset(Dataset):
         y = torch.from_numpy(gt).unsqueeze(0).float()   # GT target
         li_t = torch.from_numpy(li).unsqueeze(0).float()# LI guidance map
 
+        m_t = None
+        if mask_file is not None:
+            mask_np = self._load_npy(os.path.join(self.mask_dir, mask_file))
+            # normalize to 0/1
+            if mask_np.max() > 1:
+                mask_np = (mask_np > 0).astype(np.float32)
+            m_t = torch.from_numpy(mask_np).unsqueeze(0).float()
+
         if self.transform:
             x = self.transform(x)
             y = self.transform(y)
             li_t = self.transform(li_t)
+            if m_t is not None:
+                m_t = self.transform(m_t)
 
-        # Return (x, y, li)
+        # Return (x, y, li) or (x, y, mask, li)
+        if m_t is not None:
+            return x, y, m_t, li_t
         return x, y, li_t
 

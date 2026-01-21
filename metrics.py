@@ -64,6 +64,87 @@ def compute_SSIM(img1, img2, data_range, window_size=11, channel=1, size_average
         return ssim_map.mean(1).mean(1).mean(1).item()
 
 
+def compute_masked_SSIM(img1, img2, data_range, mask=None, metalmask=None,
+                        window_size=11, channel=1, size_average=True, spatial_dims=2,
+                        metal_fill=None, hu_min=-1024.0, hu_max=3072.0):
+    """
+    Tensor-based SSIM computation that mirrors `compute_SSIM` internals but
+    returns the full SSIM map and the mean SSIM computed only over `mask`.
+    Pixels inside `metalmask` are set to 100 in both images prior to SSIM,
+    matching the AAPM scoring behavior.
+
+    Returns: (ssim_map, ssim_masked_mean)
+      - ssim_map: tensor of SSIM values (same shape as internal map)
+      - ssim_masked_mean: python float average of ssim_map over mask (or
+        global mean if mask is None or has no positive pixels)
+    """
+    # ensure tensors
+    if not torch.is_tensor(img1):
+        img1 = torch.from_numpy(np.asarray(img1)).float()
+    if not torch.is_tensor(img2):
+        img2 = torch.from_numpy(np.asarray(img2)).float()
+
+    # reshape 2D to (1,1,H,W) as in compute_SSIM
+    if len(img1.size()) == 2:
+        shape_ = img1.shape
+        img1 = img1.view(1, 1, *shape_)
+        img2 = img2.view(1, 1, *shape_)
+
+    # determine metal fill value
+    if metal_fill is None:
+        # if data_range==1.0 assume normalized images in [0,1] and compute normalized 100 HU
+        if float(data_range) == 1.0:
+            metal_fill = (100.0 - float(hu_min)) / (float(hu_max) - float(hu_min))
+        else:
+            metal_fill = 100.0
+
+    # apply metal mask by setting metal pixels to 100 (match scoring utils)
+    if metalmask is not None:
+        if not torch.is_tensor(metalmask):
+            metalmask = torch.from_numpy(np.asarray(metalmask))
+        mm = metalmask.float()
+        if len(mm.size()) == 2:
+            mm = mm.view(1, 1, *mm.shape)
+        img1 = img1.clone()
+        img2 = img2.clone()
+        img1[mm == 1] = float(metal_fill)
+        img2[mm == 1] = float(metal_fill)
+
+    window = create_window(window_size, channel, spatial_dims=spatial_dims)
+    window = window.type_as(img1)
+    conv_op = F.conv2d if spatial_dims == 2 else F.conv3d
+
+    mu1 = conv_op(img1, window, padding=window_size // 2)
+    mu2 = conv_op(img2, window, padding=window_size // 2)
+    mu1_sq, mu2_sq = mu1.pow(2), mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = conv_op(img1 * img1, window, padding=window_size // 2) - mu1_sq
+    sigma2_sq = conv_op(img2 * img2, window, padding=window_size // 2) - mu2_sq
+    sigma12 = conv_op(img1 * img2, window, padding=window_size // 2) - mu1_mu2
+
+    C1, C2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    # compute masked mean
+    if mask is None:
+        ssim_masked_mean = float(ssim_map.mean().item())
+    else:
+        if not torch.is_tensor(mask):
+            mask = torch.from_numpy(np.asarray(mask))
+        m = mask.float()
+        if len(m.size()) == 2:
+            m = m.view(1, 1, *m.shape)
+        m = m.to(ssim_map.device)
+        masked_vals = ssim_map[m == 1]
+        if masked_vals.numel() == 0:
+            ssim_masked_mean = float(ssim_map.mean().item())
+        else:
+            ssim_masked_mean = float(masked_vals.mean().item())
+
+    return ssim_map, ssim_masked_mean
+
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()

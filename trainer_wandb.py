@@ -290,7 +290,8 @@ from models.swin_unet_mask_guided.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
 
 import numpy as np
-from metrics import compute_SSIM, compute_PSNR, compute_RMSE
+from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM
+from skimage.metrics import structural_similarity as sk_ssim
 import wandb
 
 # ----------------------------- Utilities -----------------------------
@@ -385,6 +386,7 @@ def main():
     # Data & run setup
     parser.add_argument('--ma_dir', type=str, required=True)
     parser.add_argument('--li_dir', type=str, required=False, help='Required for artifact guidance / ma_li mode')
+    parser.add_argument('--mask_dir', type=str, required=False, help='Optional: directory with metal masks (metalonlymask files)')
     parser.add_argument('--gt_dir', type=str, required=True)
     parser.add_argument('--input_mode', type=str, choices=['ma_li', 'ma'], default='ma',
                         help="Use 'ma_li' for using LI guidance. For Swin->single-stream keep MA-only input but pass LI as artifact_map.")
@@ -454,6 +456,7 @@ def main():
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
         li_dir=args.li_dir if args.input_mode == 'ma_li' else None,
+        mask_dir=args.mask_dir,
         split='train',
         hu_min=float(args.hu_min),
         hu_max=float(args.hu_max),
@@ -486,20 +489,37 @@ def main():
         train_loss = 0.0
 
         for batch in train_loader:
-            # dataset returns either (x,y,li) or (x,y) depending on dataset construction.
-            if args.input_mode == 'ma_li':
-                # dataset returns x,y,li
-                x_batch, y_batch, li_batch = batch
+            # unpack batch robustly: support (x,y), (x,y,li), (x,y,mask), (x,y,mask,li)
+            x_batch = y_batch = li_batch = mask_batch = None
+            if isinstance(batch, (list, tuple)):
+                if len(batch) == 2:
+                    x_batch, y_batch = batch
+                elif len(batch) == 3:
+                    third = batch[2]
+                    # lightweight heuristic: if third is binary -> mask, else LI
+                    is_binary = False
+                    try:
+                        uniq = torch.unique(third)
+                        is_binary = (uniq.numel() <= 2) and torch.all((uniq == 0) | (uniq == 1))
+                    except Exception:
+                        is_binary = False
+                    if is_binary:
+                        x_batch, y_batch, mask_batch = batch
+                    else:
+                        x_batch, y_batch, li_batch = batch
+                else:
+                    # 4+ items -> assume (x,y,mask,li)
+                    x_batch, y_batch, mask_batch, li_batch = batch[:4]
             else:
-                # dataset returns x,y
                 x_batch, y_batch = batch
-                li_batch = None
 
             # Move to device
             x_batch = x_batch.to(device, non_blocking=True)
             y_batch = y_batch.to(device, non_blocking=True)
             if li_batch is not None:
                 li_batch = li_batch.to(device, non_blocking=True)
+            if mask_batch is not None:
+                mask_batch = mask_batch.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -540,13 +560,36 @@ def main():
         total_ssim = 0.0
         total_psnr = 0.0
         total_rmse = 0.0
+        total_masked_ssim = 0.0
+        total_score_py_ssim = 0.0
+        # compute normalized metal fill for normalized images
+        metal_fill_norm = (100.0 - float(args.hu_min)) / (float(args.hu_max) - float(args.hu_min))
         with torch.no_grad():
             for batch in val_loader:
-                if args.input_mode == 'ma_li':
-                    x_batch, y_batch, li_batch = batch
+                # unpack batch robustly: support (x,y), (x,y,li), (x,y,mask), (x,y,mask,li)
+                x_batch = y_batch = li_batch = mask_batch = None
+                if isinstance(batch, (list, tuple)):
+                    if len(batch) == 2:
+                        x_batch, y_batch = batch
+                    elif len(batch) == 3:
+                        # decide whether third item is LI (continuous) or mask (binary)
+                        third = batch[2]
+                        # check binary mask heuristic
+                        try:
+                            uniq = torch.unique(third)
+                            is_binary = (uniq.numel() <= 2) and torch.all((uniq == 0) | (uniq == 1))
+                        except Exception:
+                            is_binary = False
+                        if is_binary:
+                            x_batch, y_batch, mask_batch = batch
+                        else:
+                            x_batch, y_batch, li_batch = batch
+                    else:
+                        # 4+ items -> assume (x,y,mask,li)
+                        x_batch, y_batch, mask_batch, li_batch = batch[:4]
                 else:
+                    # fallback
                     x_batch, y_batch = batch
-                    li_batch = None
 
                 x_batch = x_batch.to(device, non_blocking=True)
                 y_batch = y_batch.to(device, non_blocking=True)
@@ -574,20 +617,54 @@ def main():
 
                 # compute per-image metrics
                 for i in range(pred_eval.size(0)):
-                    total_ssim += compute_SSIM(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
-                    total_psnr += compute_PSNR(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu(), data_range=1.0)
-                    total_rmse += compute_RMSE(pred_eval[i, 0].cpu(), gt_eval[i, 0].cpu())
+                    img_pred = pred_eval[i, 0].cpu()
+                    img_gt = gt_eval[i, 0].cpu()
+                    total_ssim += compute_SSIM(img_pred, img_gt, data_range=1.0)
+                    total_psnr += compute_PSNR(img_pred, img_gt, data_range=1.0)
+                    total_rmse += compute_RMSE(img_pred, img_gt)
+
+                    # compute masked SSIM: treat dataset mask as metal mask (set metals to normalized 100HU)
+                    metalmask_arg = None
+                    if mask_batch is not None:
+                        m = mask_batch[i]
+                        if m.dim() == 3 and m.size(0) == 1:
+                            m = m.squeeze(0)
+                        metalmask_arg = m.cpu()
+                    _, masked_val = compute_masked_SSIM(img_pred, img_gt, data_range=1.0, mask=None, metalmask=metalmask_arg, metal_fill=metal_fill_norm, hu_min=args.hu_min, hu_max=args.hu_max)
+                    total_masked_ssim += masked_val
+
+                    # compute score_py_ssim using scikit-image (match score.py parameters)
+                    try:
+                        ref_np = img_gt.numpy()
+                        pred_np = img_pred.numpy()
+                        # apply metal fill to numpy arrays if metalmask available
+                        if metalmask_arg is not None:
+                            metal_np = metalmask_arg.numpy().astype(bool)
+                            ref_np = ref_np.copy()
+                            pred_np = pred_np.copy()
+                            ref_np[metal_np] = metal_fill_norm
+                            pred_np[metal_np] = metal_fill_norm
+
+                        sc_res = sk_ssim(ref_np, pred_np, sigma=1.5, gaussian_weights=True,
+                                         use_sample_covariance=False, data_range=1.0, full=True)
+                        # sk_ssim returns (score, full_map) when full=True
+                        full_map = sc_res[1]
+                        score_py_masked = float(full_map.mean())
+                    except Exception:
+                        score_py_masked = float(masked_val)
+                    total_score_py_ssim += score_py_masked
 
         avg_psnr = total_psnr / len(val_ds)
         avg_ssim = total_ssim / len(val_ds)
         avg_rmse = total_rmse / len(val_ds)
+        avg_masked_ssim = total_masked_ssim / len(val_ds)
 
         # ---------------- Log to W&B ----------------
         wandb.log(
-            {"loss": avg_loss, "psnr": avg_psnr, "ssim": avg_ssim, "rmse": avg_rmse, "epoch": epoch},
+            {"loss": avg_loss, "psnr": avg_psnr, "ssim": avg_ssim, "masked_ssim": avg_masked_ssim, "rmse": avg_rmse, "epoch": epoch},
             step=epoch
         )
-        print(f"[Epoch {epoch}] Loss: {avg_loss:.4f} PSNR: {avg_psnr:.2f} SSIM: {avg_ssim:.4f} RMSE: {avg_rmse:.4f}")
+        print(f"[Epoch {epoch}] Loss: {avg_loss:.4f} PSNR: {avg_psnr:.2f} SSIM: {avg_ssim:.4f} masked_SSIM: {avg_masked_ssim:.4f} RMSE: {avg_rmse:.4f}")
 
         # ---------------- Save checkpoints ----------------
         # Save only a rolling "last.pt" (overwritten every epoch)
