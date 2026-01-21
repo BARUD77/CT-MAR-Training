@@ -233,6 +233,7 @@ class CTMetalArtifactDataset(Dataset):
             raise ValueError("li_dir must be provided for artifact-guided training (LI is required).")
 
         self.ma_dir, self.gt_dir, self.li_dir = ma_dir, gt_dir, li_dir
+        self.mask_dir = mask_dir
         self.split, self.transform = split, transform
         self.image_shape = tuple(image_shape)
         self.hu_min, self.hu_max = float(hu_min), float(hu_max)
