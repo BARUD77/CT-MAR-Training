@@ -339,14 +339,13 @@ class CTMetalArtifactDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx: int):
-        ma_file, gt_file, li_file = self.pairs[idx]
-
         # Support pairs of length 3: (ma, gt, li) and length 4: (ma, gt, mask, li)
-        if len(self.pairs[idx]) == 3:
-            ma_file, gt_file, li_file = self.pairs[idx]
+        entry = self.pairs[idx]
+        if len(entry) == 3:
+            ma_file, gt_file, li_file = entry
             mask_file = None
         else:
-            ma_file, gt_file, mask_file, li_file = self.pairs[idx]
+            ma_file, gt_file, mask_file, li_file = entry
 
         ma = self._clip_and_norm01(self._load_npy(os.path.join(self.ma_dir, ma_file)))
         gt = self._clip_and_norm01(self._load_npy(os.path.join(self.gt_dir, gt_file)))
