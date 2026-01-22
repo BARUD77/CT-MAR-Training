@@ -221,6 +221,7 @@ class CTMetalArtifactDataset(Dataset):
         image_shape: Tuple[int, int] = (512, 512),
         hu_min: float = -1024.0,
         hu_max: float = 3072.0,
+        clip_hu: bool = True,
         transform=None,
         # region filter: "all" (default), "body" (only body), "head" (only head)
         region_policy: str = "all",
@@ -238,6 +239,7 @@ class CTMetalArtifactDataset(Dataset):
         self.image_shape = tuple(image_shape)
         self.hu_min, self.hu_max = float(hu_min), float(hu_max)
         self._dr = self.hu_max - self.hu_min
+        self.clip_hu = bool(clip_hu)
 
         # Regex for your filenames
         # training_{region}_{kind}_img{ID}_{HxWxZ}.npy
@@ -333,7 +335,8 @@ class CTMetalArtifactDataset(Dataset):
         return arr
 
     def _clip_and_norm01(self, hu: np.ndarray) -> np.ndarray:
-        hu = np.clip(hu, self.hu_min, self.hu_max)
+        if self.clip_hu:
+            hu = np.clip(hu, self.hu_min, self.hu_max)
         return (hu - self.hu_min) / self._dr
 
     def __len__(self):
