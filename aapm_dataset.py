@@ -222,6 +222,7 @@ class CTMetalArtifactDataset(Dataset):
         hu_min: float = -1024.0,
         hu_max: float = 3072.0,
         clip_hu: bool = True,
+        output_space: str = "norm",
         transform=None,
         # region filter: "all" (default), "body" (only body), "head" (only head)
         region_policy: str = "all",
@@ -240,6 +241,9 @@ class CTMetalArtifactDataset(Dataset):
         self.hu_min, self.hu_max = float(hu_min), float(hu_max)
         self._dr = self.hu_max - self.hu_min
         self.clip_hu = bool(clip_hu)
+        if output_space not in {"norm", "hu"}:
+            raise ValueError("output_space must be 'norm' or 'hu'")
+        self.output_space = output_space
 
         # Regex for your filenames
         # training_{region}_{kind}_img{ID}_{HxWxZ}.npy
@@ -339,6 +343,11 @@ class CTMetalArtifactDataset(Dataset):
             hu = np.clip(hu, self.hu_min, self.hu_max)
         return (hu - self.hu_min) / self._dr
 
+    def _maybe_clip_hu(self, hu: np.ndarray) -> np.ndarray:
+        if self.clip_hu:
+            return np.clip(hu, self.hu_min, self.hu_max)
+        return hu
+
     def __len__(self):
         return len(self.pairs)
 
@@ -351,9 +360,18 @@ class CTMetalArtifactDataset(Dataset):
         else:
             ma_file, gt_file, mask_file, li_file = entry
 
-        ma = self._clip_and_norm01(self._load_npy(os.path.join(self.ma_dir, ma_file)))
-        gt = self._clip_and_norm01(self._load_npy(os.path.join(self.gt_dir, gt_file)))
-        li = self._clip_and_norm01(self._load_npy(os.path.join(self.li_dir, li_file)))
+        ma_hu = self._load_npy(os.path.join(self.ma_dir, ma_file)).astype(np.float32)
+        gt_hu = self._load_npy(os.path.join(self.gt_dir, gt_file)).astype(np.float32)
+        li_hu = self._load_npy(os.path.join(self.li_dir, li_file)).astype(np.float32)
+
+        if self.output_space == "hu":
+            ma = self._maybe_clip_hu(ma_hu)
+            gt = self._maybe_clip_hu(gt_hu)
+            li = self._maybe_clip_hu(li_hu)
+        else:
+            ma = self._clip_and_norm01(ma_hu)
+            gt = self._clip_and_norm01(gt_hu)
+            li = self._clip_and_norm01(li_hu)
 
         x = torch.from_numpy(ma).unsqueeze(0).float()   # MA input
         y = torch.from_numpy(gt).unsqueeze(0).float()   # GT target

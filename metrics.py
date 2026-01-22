@@ -145,6 +145,78 @@ def compute_masked_SSIM(img1, img2, data_range, mask=None, metalmask=None,
     return ssim_map, ssim_masked_mean
 
 
+def compute_masked_SSIM_per_image(img1, img2, data_range, mask=None, metalmask=None,
+                                 window_size=11, channel=1, spatial_dims=2,
+                                 metal_fill=None, hu_min=-1024.0, hu_max=3072.0):
+    """Vectorized SSIM that returns a per-image masked mean.
+
+    Inputs may be 2D (H,W) or 4D (B,1,H,W). Returns:
+      - ssim_map: (B,1,H,W)
+      - per_image: (B,) tensor of masked mean SSIM values
+    """
+    if not torch.is_tensor(img1):
+        img1 = torch.from_numpy(np.asarray(img1)).float()
+    if not torch.is_tensor(img2):
+        img2 = torch.from_numpy(np.asarray(img2)).float()
+
+    if img1.dim() == 2:
+        img1 = img1.view(1, 1, *img1.shape)
+        img2 = img2.view(1, 1, *img2.shape)
+
+    if metal_fill is None:
+        if float(data_range) == 1.0:
+            metal_fill = (100.0 - float(hu_min)) / (float(hu_max) - float(hu_min))
+        else:
+            metal_fill = 100.0
+
+    if metalmask is not None:
+        if not torch.is_tensor(metalmask):
+            metalmask = torch.from_numpy(np.asarray(metalmask))
+        mm = metalmask.float()
+        if mm.dim() == 2:
+            mm = mm.view(1, 1, *mm.shape)
+        if mm.dim() == 3:
+            mm = mm.view(mm.size(0), 1, mm.size(1), mm.size(2))
+        mm = mm.to(img1.device)
+        img1 = img1.clone()
+        img2 = img2.clone()
+        img1[mm == 1] = float(metal_fill)
+        img2[mm == 1] = float(metal_fill)
+
+    window = create_window(window_size, channel, spatial_dims=spatial_dims).type_as(img1)
+    conv_op = F.conv2d if spatial_dims == 2 else F.conv3d
+
+    mu1 = conv_op(img1, window, padding=window_size // 2)
+    mu2 = conv_op(img2, window, padding=window_size // 2)
+    mu1_sq, mu2_sq = mu1.pow(2), mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = conv_op(img1 * img1, window, padding=window_size // 2) - mu1_sq
+    sigma2_sq = conv_op(img2 * img2, window, padding=window_size // 2) - mu2_sq
+    sigma12 = conv_op(img1 * img2, window, padding=window_size // 2) - mu1_mu2
+
+    C1, C2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    if mask is None:
+        per_image = ssim_map.mean(dim=(1, 2, 3))
+    else:
+        if not torch.is_tensor(mask):
+            mask = torch.from_numpy(np.asarray(mask))
+        m = mask.float()
+        if m.dim() == 2:
+            m = m.view(1, 1, *m.shape)
+        if m.dim() == 3:
+            m = m.view(m.size(0), 1, m.size(1), m.size(2))
+        m = m.to(ssim_map.device)
+
+        masked_sum = (ssim_map * m).sum(dim=(1, 2, 3))
+        denom = m.sum(dim=(1, 2, 3)).clamp_min(1.0)
+        per_image = masked_sum / denom
+
+    return ssim_map, per_image
+
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()

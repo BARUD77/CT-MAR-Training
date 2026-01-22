@@ -290,50 +290,12 @@ from models.swin_unet_mask_guided.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
 
 import numpy as np
-from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM
-from skimage.metrics import structural_similarity as sk_ssim
+from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM, compute_masked_SSIM_per_image
 import wandb
 
 
-class _WithIndex(torch.utils.data.Dataset):
-    def __init__(self, base_ds):
-        self.base_ds = base_ds
-
-    def __len__(self):
-        return len(self.base_ds)
-
-    def __getitem__(self, idx):
-        return idx, self.base_ds[idx]
-
-
-def _load_npy_2d(path: str) -> np.ndarray:
-    arr = np.load(path)
-    if arr.ndim == 3 and arr.shape[-1] == 1:
-        arr = arr[..., 0]
-    if arr.ndim != 2:
-        raise ValueError(f"Expected 2D array, got {arr.shape} in {path}")
-    return arr
-
-
-def _score_style_masked_ssim_hu(ref_hu: np.ndarray, img_hu: np.ndarray, metalmask_bool: np.ndarray) -> float:
-    """Match AAPM scorer SSIM settings, but average over non-metal pixels (since we don't have the external mask here)."""
-    ref = ref_hu.copy()
-    img = img_hu.copy()
-    ref[metalmask_bool] = 100.0
-    img[metalmask_bool] = 100.0
-
-    _, ssim_map = sk_ssim(
-        ref,
-        img,
-        sigma=1.5,
-        gaussian_weights=True,
-        use_sample_covariance=False,
-        data_range=5000,
-        full=True,
-        grad=False,
-    )
-    non_metal = ~metalmask_bool
-    return float(ssim_map[non_metal].mean())
+def _to_hu(x: torch.Tensor, hu_min: float, hu_max: float) -> torch.Tensor:
+    return x * (float(hu_max) - float(hu_min)) + float(hu_min)
 
 # ----------------------------- Utilities -----------------------------
 def dict_to_namespace(d):
@@ -433,6 +395,8 @@ def main():
                         help="Use 'ma_li' for using LI guidance. For Swin->single-stream keep MA-only input but pass LI as artifact_map.")
     parser.add_argument('--num_classes', type=int, default=1, help='Output channels/classes')
     parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='DataLoader workers. In Colab, set --num_workers 0 if you hit multiprocessing issues.')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
@@ -503,6 +467,7 @@ def main():
         hu_min=float(args.hu_min),
         hu_max=float(args.hu_max),
         clip_hu=(not args.no_clip),
+        output_space="norm",
         region_policy=args.region_policy,
         seed=42,
         val_size=0.1
@@ -510,12 +475,17 @@ def main():
 
     # Build train/val datasets
     train_ds = CTMetalArtifactDataset(**{**dataset_kwargs, "split": "train"})
+    # Normalized validation dataset for model I/O + normalized metrics
     val_ds   = CTMetalArtifactDataset(**{**dataset_kwargs, "split": "val"})
-    val_ds_indexed = _WithIndex(val_ds)
+    # HU validation dataset for HU-domain metrics (no extra np.load inside the loop)
+    val_ds_hu = CTMetalArtifactDataset(**{**dataset_kwargs, "split": "val", "output_space": "hu"})
+    # Ensure perfect alignment between the two val loaders
+    val_ds_hu.pairs = val_ds.pairs
 
     pin = (device.type == 'cuda')
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=pin)
-    val_loader   = DataLoader(val_ds_indexed, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=pin)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=pin)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=pin)
+    val_loader_hu = DataLoader(val_ds_hu, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=pin)
 
     print(f"Training on {len(train_ds)} samples, validating on {len(val_ds)} samples.")
 
@@ -605,43 +575,66 @@ def main():
         total_psnr = 0.0
         total_rmse = 0.0
         total_masked_ssim = 0.0
-        total_score_py_ssim = 0.0
         total_score_hu_ssim = 0.0
         total_li_gt_hu_ssim = 0.0
         # compute normalized metal fill for normalized images
         metal_fill_norm = (100.0 - float(args.hu_min)) / (float(args.hu_max) - float(args.hu_min))
+        metal_fill_hu = 100.0
+        data_range_hu = 5000.0
         with torch.no_grad():
-            for batch in val_loader:
-                # batch is (idx_batch, data_batch)
-                if not isinstance(batch, (list, tuple)) or len(batch) != 2:
-                    raise RuntimeError("Expected val batch to be a 2-tuple: (idx_batch, data_batch)")
-                idx_batch, data_batch = batch
-
-                # unpack data_batch robustly: support (x,y), (x,y,li), (x,y,mask), (x,y,mask,li)
+            for batch, batch_hu in zip(val_loader, val_loader_hu):
+                # unpack batch robustly: support (x,y), (x,y,li), (x,y,mask), (x,y,mask,li)
                 x_batch = y_batch = li_batch = mask_batch = None
-                if isinstance(data_batch, (list, tuple)):
-                    if len(data_batch) == 2:
-                        x_batch, y_batch = data_batch
-                    elif len(data_batch) == 3:
-                        third = data_batch[2]
+                if isinstance(batch, (list, tuple)):
+                    if len(batch) == 2:
+                        x_batch, y_batch = batch
+                    elif len(batch) == 3:
+                        third = batch[2]
                         try:
                             uniq = torch.unique(third)
                             is_binary = (uniq.numel() <= 2) and torch.all((uniq == 0) | (uniq == 1))
                         except Exception:
                             is_binary = False
                         if is_binary:
-                            x_batch, y_batch, mask_batch = data_batch
+                            x_batch, y_batch, mask_batch = batch
                         else:
-                            x_batch, y_batch, li_batch = data_batch
+                            x_batch, y_batch, li_batch = batch
                     else:
-                        x_batch, y_batch, mask_batch, li_batch = data_batch[:4]
+                        x_batch, y_batch, mask_batch, li_batch = batch[:4]
                 else:
-                    x_batch, y_batch = data_batch
+                    x_batch, y_batch = batch
 
                 x_batch = x_batch.to(device, non_blocking=True)
                 y_batch = y_batch.to(device, non_blocking=True)
                 if li_batch is not None:
                     li_batch = li_batch.to(device, non_blocking=True)
+                if mask_batch is not None:
+                    mask_batch = mask_batch.to(device, non_blocking=True)
+
+                # Unpack HU batch (same split/order; only used for HU-domain metrics)
+                x_hu = y_hu = li_hu = mask_hu = None
+                if isinstance(batch_hu, (list, tuple)):
+                    if len(batch_hu) == 2:
+                        x_hu, y_hu = batch_hu
+                    elif len(batch_hu) == 3:
+                        third_hu = batch_hu[2]
+                        try:
+                            uniq_hu = torch.unique(third_hu)
+                            is_binary_hu = (uniq_hu.numel() <= 2) and torch.all((uniq_hu == 0) | (uniq_hu == 1))
+                        except Exception:
+                            is_binary_hu = False
+                        if is_binary_hu:
+                            x_hu, y_hu, mask_hu = batch_hu
+                        else:
+                            x_hu, y_hu, li_hu = batch_hu
+                    else:
+                        x_hu, y_hu, mask_hu, li_hu = batch_hu[:4]
+                else:
+                    x_hu, y_hu = batch_hu
+
+                y_hu = y_hu.to(device, non_blocking=True)
+                if li_hu is not None:
+                    li_hu = li_hu.to(device, non_blocking=True)
 
                 if args.model.lower() in ("swinunet",):
                     if li_batch is not None:
@@ -659,82 +652,69 @@ def main():
                         x_in = x_batch
                     pred = model(x_in)
 
-                # NOTE: We intentionally do NOT clamp here so we can do HU-domain evaluation.
-                # The dataset may still normalize inputs; HU-domain metrics below load raw HU arrays from disk.
-                pred_eval = pred
-                gt_eval   = y_batch
+                # Normalized metrics are computed on clamped [0,1] tensors.
+                pred_eval = torch.clamp(pred, 0, 1)
+                gt_eval   = torch.clamp(y_batch, 0, 1)
 
                 # compute per-image metrics
                 for i in range(pred_eval.size(0)):
-                    img_pred = pred_eval[i, 0].detach().cpu()
-                    img_gt = gt_eval[i, 0].detach().cpu()
+                    img_pred = pred_eval[i, 0]
+                    img_gt = gt_eval[i, 0]
                     total_ssim += compute_SSIM(img_pred, img_gt, data_range=1.0)
                     total_psnr += compute_PSNR(img_pred, img_gt, data_range=1.0)
                     total_rmse += compute_RMSE(img_pred, img_gt)
 
                     # compute masked SSIM: treat dataset mask as metal mask (set metals to normalized 100HU)
                     metalmask_arg = None
+                    non_metal_mask = None
                     if mask_batch is not None:
                         m = mask_batch[i]
                         if m.dim() == 3 and m.size(0) == 1:
                             m = m.squeeze(0)
-                        metalmask_arg = m.cpu()
-                    _, masked_val = compute_masked_SSIM(img_pred, img_gt, data_range=1.0, mask=None, metalmask=metalmask_arg, metal_fill=metal_fill_norm, hu_min=args.hu_min, hu_max=args.hu_max)
+                        if m.dim() == 3 and m.size(0) == 1:
+                            m = m.squeeze(0)
+                        metalmask_arg = m
+                        non_metal_mask = (m == 0).float()
+
+                    _, masked_val = compute_masked_SSIM(
+                        img_pred,
+                        img_gt,
+                        data_range=1.0,
+                        mask=non_metal_mask,
+                        metalmask=metalmask_arg,
+                        metal_fill=metal_fill_norm,
+                        hu_min=args.hu_min,
+                        hu_max=args.hu_max,
+                    )
                     total_masked_ssim += masked_val
 
-                    # compute score_py_ssim using scikit-image (match score.py parameters)
-                    try:
-                        ref_np = img_gt.numpy()
-                        pred_np = img_pred.numpy()
-                        # apply metal fill to numpy arrays if metalmask available
-                        if metalmask_arg is not None:
-                            metal_np = metalmask_arg.numpy().astype(bool)
-                            ref_np = ref_np.copy()
-                            pred_np = pred_np.copy()
-                            ref_np[metal_np] = metal_fill_norm
-                            pred_np[metal_np] = metal_fill_norm
+                    # HU-domain masked SSIM computed on GPU tensors (no skimage, no np.load)
+                    if metalmask_arg is not None:
+                        # Use the model output (normalized space) mapped back to HU, but compare against
+                        # the HU-domain ground truth from val_ds_hu (optionally unclipped if --no_clip).
+                        img_pred_hu = _to_hu(pred[i, 0], args.hu_min, args.hu_max)
+                        img_gt_hu = y_hu[i, 0]
+                        _, hu_val = compute_masked_SSIM(
+                            img_pred_hu,
+                            img_gt_hu,
+                            data_range=data_range_hu,
+                            mask=non_metal_mask,
+                            metalmask=metalmask_arg,
+                            metal_fill=metal_fill_hu,
+                        )
+                        total_score_hu_ssim += hu_val
 
-                        sc_res = sk_ssim(ref_np, pred_np, sigma=1.5, gaussian_weights=True,
-                                         use_sample_covariance=False, data_range=1.0, full=True)
-                        # sk_ssim returns (score, full_map) when full=True
-                        full_map = sc_res[1]
-                        score_py_masked = float(full_map.mean())
-                    except Exception:
-                        score_py_masked = float(masked_val)
-                    total_score_py_ssim += score_py_masked
-
-                    # -------- HU-domain score.py-style SSIM (unclipped raw HU loaded from disk) --------
-                    try:
-                        ds_idx = int(idx_batch[i].item())
-                        entry = val_ds.pairs[ds_idx]
-                        if len(entry) == 3:
-                            ma_file, gt_file, li_file = entry
-                            mask_file = None
-                        else:
-                            ma_file, gt_file, mask_file, li_file = entry
-
-                        gt_hu = _load_npy_2d(os.path.join(val_ds.gt_dir, gt_file)).astype(np.float32)
-                        li_hu = _load_npy_2d(os.path.join(val_ds.li_dir, li_file)).astype(np.float32)
-
-                        # Prefer loading metal mask from disk if we have the filename; otherwise use batch mask
-                        if mask_file is not None and getattr(val_ds, "mask_dir", None) is not None:
-                            metalmask_bool = _load_npy_2d(os.path.join(val_ds.mask_dir, mask_file))
-                            metalmask_bool = (metalmask_bool > 0)
-                        elif metalmask_arg is not None:
-                            metalmask_bool = metalmask_arg.numpy().astype(bool)
-                        else:
-                            metalmask_bool = None
-
-                        if metalmask_bool is not None:
-                            # pred is in dataset-normalized space. Map it back to HU range.
-                            pred01 = img_pred.numpy().astype(np.float32)
-                            pred_hu = pred01 * (float(args.hu_max) - float(args.hu_min)) + float(args.hu_min)
-
-                            total_score_hu_ssim += _score_style_masked_ssim_hu(gt_hu, pred_hu, metalmask_bool)
-                            total_li_gt_hu_ssim += _score_style_masked_ssim_hu(gt_hu, li_hu, metalmask_bool)
-                    except Exception:
-                        # Keep training robust; HU metrics are only for sanity/debug
-                        pass
+                        if li_hu is not None:
+                            li_img_hu = li_hu[i, 0]
+                            _, li_gt_hu_val = compute_masked_SSIM(
+                                li_img_hu,
+                                img_gt_hu,
+                                data_range=data_range_hu,
+                                mask=non_metal_mask,
+                                metalmask=metalmask_arg,
+                                metal_fill=metal_fill_hu,
+                            )
+                            total_li_gt_hu_ssim += li_gt_hu_val
 
         avg_psnr = total_psnr / len(val_ds)
         avg_ssim = total_ssim / len(val_ds)
