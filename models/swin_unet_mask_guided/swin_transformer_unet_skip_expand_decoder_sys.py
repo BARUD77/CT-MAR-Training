@@ -73,7 +73,7 @@ def window_reverse(windows, window_size, H, W):
 
 class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
-        Now supports an optional per-window metal_bias (artifact map bias).
+        Now supports an optional per-window artifact score prior and/or a per-window metal_bias.
     """
 
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
@@ -112,12 +112,19 @@ class WindowAttention(nn.Module):
         # learnable global scale for metal bias (helps stability)
         self.register_parameter("metal_scale", nn.Parameter(torch.tensor(1.0, dtype=torch.float32)))
 
-    def forward(self, x, mask=None, metal_bias=None):
+        # Artifact-Aware Self-Attention prior parameters.
+        # Constrained positive in forward via softplus: alpha>0, beta>0, lambda>=0.
+        self.register_parameter("aa_alpha", nn.Parameter(torch.tensor(1.0, dtype=torch.float32)))
+        self.register_parameter("aa_beta", nn.Parameter(torch.tensor(1.0, dtype=torch.float32)))
+        self.register_parameter("aa_lambda", nn.Parameter(torch.tensor(0.1, dtype=torch.float32)))
+
+    def forward(self, x, mask=None, metal_bias=None, artifact_scores=None):
         """
         Args:
             x: (num_windows*B, N, C)
             mask: attention mask or None
             metal_bias: optional (num_windows*B, N) tensor with per-token biases (same device/dtype as x)
+            artifact_scores: optional (num_windows*B, N) tensor with per-token artifact scores a in [0,1]
         """
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -132,6 +139,23 @@ class WindowAttention(nn.Module):
             self.window_size[0] * self.window_size[1], -1)
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, N, N
         attn = attn + relative_position_bias.unsqueeze(0)
+
+        # Artifact-aware structured prior term (added to logits BEFORE softmax)
+        # L_ij = Q_i K_j^T / sqrt(d) + lambda * [ alpha * a_i(1-a_j) - beta * a_i a_j ]
+        if artifact_scores is not None:
+            a = artifact_scores.to(attn.dtype).to(attn.device)
+            # Expected already normalized; clamp for safety.
+            a = a.clamp(0.0, 1.0)
+            a = a.view(B_, 1, N)  # (B_, 1, N)
+            a_i = a.unsqueeze(-1)  # (B_, 1, N, 1)
+            a_j = a.unsqueeze(-2)  # (B_, 1, 1, N)
+
+            alpha = F.softplus(self.aa_alpha)
+            beta = F.softplus(self.aa_beta)
+            lambda_ = F.softplus(self.aa_lambda)
+
+            prior = alpha * a_i * (1.0 - a_j) - beta * a_i * a_j  # (B_, 1, N, N)
+            attn = attn + lambda_ * prior  # broadcast over heads
 
         # metal_bias injection: bias over key positions (last dim)
         if metal_bias is not None:
@@ -265,8 +289,8 @@ class SwinTransformerBlock(nn.Module):
         else:
             am_windows = None
 
-        # W-MSA / SW-MSA with metal_bias
-        attn_windows = self.attn(x_windows, mask=self.attn_mask, metal_bias=am_windows)
+        # W-MSA / SW-MSA with artifact-aware prior (and optional metal_bias if used elsewhere)
+        attn_windows = self.attn(x_windows, mask=self.attn_mask, artifact_scores=am_windows)
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -649,7 +673,7 @@ class SwinTransformerSys(nn.Module):
 
             if am is not None:
                 # resize artifact map to stage spatial size (Hs, Ws)
-                am_stage = F.interpolate(am.unsqueeze(1), size=(Hs, Ws), mode='bilinear', align_corners=False)  # (B,1,Hs,Ws)
+                am_stage = F.adaptive_avg_pool2d(am.unsqueeze(1), output_size=(Hs, Ws))  # (B,1,Hs,Ws)
                 am_stage = am_stage[:, 0]  # (B,Hs,Ws)
             else:
                 am_stage = None
