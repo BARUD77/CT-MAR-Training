@@ -9,9 +9,40 @@ from torch.utils.data import DataLoader
 from aapm_dataset import CTMetalArtifactDataset
 from models.swin_unet_mask_guided.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
-from metrics import compute_SSIM, compute_PSNR, compute_RMSE
+from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM
 import numpy as np
 import wandb
+
+
+def _to_hu(x: torch.Tensor, hu_min: float, hu_max: float) -> torch.Tensor:
+    return x * (float(hu_max) - float(hu_min)) + float(hu_min)
+
+
+def _unpack_batch(batch):
+    """Unpack dataset batch to (x, y, mask, li) where mask/li may be None.
+
+    Supports tuples of length 3: (x,y,li) and length 4: (x,y,mask,li).
+    """
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Unexpected batch type: {type(batch)}")
+    if len(batch) == 3:
+        x, y, third = batch
+        # In our aapm_dataset, third is LI (float). If someone passed masks it might be binary.
+        try:
+            uniq = torch.unique(third)
+            is_binary = (uniq.numel() <= 2) and torch.all((uniq == 0) | (uniq == 1))
+        except Exception:
+            is_binary = False
+        if is_binary:
+            return x, y, third, None
+        return x, y, None, third
+    if len(batch) >= 4:
+        x, y, mask, li = batch[:4]
+        return x, y, mask, li
+    if len(batch) == 2:
+        x, y = batch
+        return x, y, None, None
+    raise ValueError(f"Unsupported batch length: {len(batch)}")
 
 def dict_to_namespace(d):
     if isinstance(d, dict):
@@ -60,6 +91,7 @@ def main():
     p.add_argument('--ma_dir', type=str, required=True)
     p.add_argument('--li_dir', type=str, required=False, help='Required for input_mode=ma_li (guidance)')
     p.add_argument('--gt_dir', type=str, required=True)
+    p.add_argument('--mask_dir', type=str, default=None, help='Optional metal-only mask dir (enables masked SSIM + score HU SSIM)')
     p.add_argument('--split', type=str, choices=['train','val','test'], default='train')
     p.add_argument('--input_mode', type=str, choices=['ma','ma_li'], default='ma',
                    help="'ma' uses MA only. 'ma_li' uses LI guidance (and concatenates for UNet).")
@@ -110,19 +142,41 @@ def main():
     model.load_state_dict(state)
     model.eval()
 
-    # Dataset & loader
+    # Dataset & loaders
+    # NOTE: aapm_dataset.CTMetalArtifactDataset requires LI to exist on disk.
     ds = CTMetalArtifactDataset(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
-        li_dir=args.li_dir if args.input_mode == 'ma_li' else None,
+        li_dir=args.li_dir,
+        mask_dir=args.mask_dir,
         split=args.split,
         val_size=0.0,
         hu_min=args.hu_min,
         hu_max=args.hu_max,
         region_policy=args.region_policy,
+        output_space="norm",
     )
+    ds_hu = CTMetalArtifactDataset(
+        ma_dir=args.ma_dir,
+        gt_dir=args.gt_dir,
+        li_dir=args.li_dir,
+        mask_dir=args.mask_dir,
+        split=args.split,
+        val_size=0.0,
+        hu_min=args.hu_min,
+        hu_max=args.hu_max,
+        region_policy=args.region_policy,
+        output_space="hu",
+    )
+    # Ensure identical ordering even if dataset internals change later.
+    ds_hu.pairs = ds.pairs
+
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False, num_workers=4,
+        pin_memory=(device.type == 'cuda')
+    )
+    loader_hu = DataLoader(
+        ds_hu, batch_size=args.batch_size, shuffle=False, num_workers=4,
         pin_memory=(device.type == 'cuda')
     )
 
@@ -130,19 +184,22 @@ def main():
 
     # Metrics
     ssim_list, psnr_list, rmse_list = [], [], []
+    masked_ssim_list, score_hu_ssim_list = [], []
+    metal_fill_norm = (100.0 - float(args.hu_min)) / (float(args.hu_max) - float(args.hu_min))
+    metal_fill_hu = 100.0
+    data_range_hu = 5000.0
 
     with torch.no_grad():
         idx_base = 0
-        for batch_idx, batch in enumerate(loader):
-            # dataset returns (x, y, li) when input_mode=ma_li else (x, y)
-            if args.input_mode == 'ma_li':
-                x, y, li = batch
-            else:
-                x, y = batch
-                li = None
+        for batch_idx, (batch, batch_hu) in enumerate(zip(loader, loader_hu)):
+            x, y, mask, li = _unpack_batch(batch)
+            _x_hu, y_hu, _mask_hu, _li_hu = _unpack_batch(batch_hu)
 
             x = x.to(device, non_blocking=True)  # (B,1,H,W)
             y = y.to(device, non_blocking=True)
+            y_hu = y_hu.to(device, non_blocking=True)
+            if mask is not None:
+                mask = mask.to(device, non_blocking=True)
 
             # Forward
             if args.model == 'swinunet':
@@ -175,6 +232,41 @@ def main():
                 psnr_list.append(float(psnr_val))
                 rmse_list.append(float(rmse_val))
 
+                # masked SSIM + score HU SSIM (only meaningful if mask is available)
+                metalmask_arg = None
+                non_metal_mask = None
+                if mask is not None:
+                    m = mask[i]
+                    if m.dim() == 3 and m.size(0) == 1:
+                        m = m.squeeze(0)
+                    metalmask_arg = m
+                    non_metal_mask = (m == 0).float()
+
+                _, masked_val = compute_masked_SSIM(
+                    pred_eval[i, 0],
+                    gt_eval[i, 0],
+                    data_range=1.0,
+                    mask=non_metal_mask,
+                    metalmask=metalmask_arg,
+                    metal_fill=metal_fill_norm,
+                    hu_min=args.hu_min,
+                    hu_max=args.hu_max,
+                )
+                masked_ssim_list.append(float(masked_val))
+
+                if metalmask_arg is not None:
+                    img_pred_hu = _to_hu(pred[i, 0], args.hu_min, args.hu_max)
+                    img_gt_hu = y_hu[i, 0]
+                    _, hu_val = compute_masked_SSIM(
+                        img_pred_hu,
+                        img_gt_hu,
+                        data_range=data_range_hu,
+                        mask=non_metal_mask,
+                        metalmask=metalmask_arg,
+                        metal_fill=metal_fill_hu,
+                    )
+                    score_hu_ssim_list.append(float(hu_val))
+
                 if args.save_preds:
                     # Save as numpy for inspection
                     np.save(os.path.join(args.save_dir, f"idx_{idx_base + i:06d}_ma.npy"),
@@ -189,17 +281,26 @@ def main():
     avg_ssim = float(np.mean(ssim_list)) if len(ssim_list) else 0.0
     avg_psnr = float(np.mean(psnr_list)) if len(psnr_list) else 0.0
     avg_rmse = float(np.mean(rmse_list)) if len(rmse_list) else 0.0
+    avg_masked_ssim = float(np.mean(masked_ssim_list)) if len(masked_ssim_list) else 0.0
+    avg_score_hu_ssim = float(np.mean(score_hu_ssim_list)) if len(score_hu_ssim_list) else 0.0
 
-    print(f"[EVAL] {args.split} | SSIM: {avg_ssim:.4f} | PSNR: {avg_psnr:.2f} dB | RMSE: {avg_rmse:.6f}")
+    print(
+        f"[EVAL] {args.split} | SSIM: {avg_ssim:.4f} | PSNR: {avg_psnr:.2f} dB | RMSE: {avg_rmse:.6f} "
+        f"| masked_SSIM: {avg_masked_ssim:.4f} | score_hu_ssim: {avg_score_hu_ssim:.4f}"
+    )
 
     if use_wandb:
         wandb.log({
             "eval/ssim_mean": avg_ssim,
             "eval/psnr_mean": avg_psnr,
             "eval/rmse_mean": avg_rmse,
+            "eval/masked_ssim_mean": avg_masked_ssim,
+            "eval/score_hu_ssim_mean": avg_score_hu_ssim,
             "eval/ssim_hist": wandb.Histogram(ssim_list),
             "eval/psnr_hist": wandb.Histogram(psnr_list),
             "eval/rmse_hist": wandb.Histogram(rmse_list),
+            "eval/masked_ssim_hist": wandb.Histogram(masked_ssim_list) if masked_ssim_list else None,
+            "eval/score_hu_ssim_hist": wandb.Histogram(score_hu_ssim_list) if score_hu_ssim_list else None,
         })
         wandb.finish()
 
