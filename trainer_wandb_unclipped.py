@@ -406,6 +406,12 @@ def main():
     parser.add_argument('--region_policy', type=str, default='all', choices=['all','body','head'],
                         help='Region filter passed to dataset (defaults to "all").')
 
+    # Artifact-aware attention bias strength (runtime override).
+    # If not set, the model uses its internal aa_lambda parameter.
+    parser.add_argument('--artifact_lambda', type=float, default=None,
+                        help='Optional override for artifact-aware attention bias strength. '
+                             'If omitted, uses the model\'s internal aa_lambda. Set 0 to disable.')
+
     # Intensity window (HU) used for clipping/normalization inside the dataset
     parser.add_argument('--hu_min', type=float, default=-1024.0, help='Minimum HU for clipping before normalization')
     parser.add_argument('--hu_max', type=float, default=3072.0, help='Maximum HU for clipping before normalization')
@@ -543,16 +549,16 @@ def main():
                 # Ensure we pass MA-only as input (x_batch should be single channel).
                 if args.input_mode == 'ma_li':
                     # Compute soft artifact map per paper:
-                    #   A_MG = max(x_LI - x_MA, 0)
+                    #   A_MG = max(x_MA - x_LI, 0)
                     # then normalize A_MG to [0,1].
                     # Shapes: x_batch (B,1,H,W), li_batch (B,1,H,W)
-                    artifact_map = torch.relu(li_batch - x_batch)
+                    artifact_map = torch.relu(x_batch - li_batch)
                     eps = 1e-6
                     am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
                     artifact_map = artifact_map / (am_max + eps)
-                    pred = model(x_batch, artifact_map=artifact_map)
+                    pred = model(x_batch, artifact_map=artifact_map, artifact_lambda=args.artifact_lambda)
                 else:
-                    pred = model(x_batch, artifact_map=None)
+                    pred = model(x_batch, artifact_map=None, artifact_lambda=args.artifact_lambda)
             else:
                 # vanilla UNet: if li present and input_mode 'ma_li', concatenate channels
                 if args.input_mode == 'ma_li' and li_batch is not None:
@@ -638,13 +644,13 @@ def main():
 
                 if args.model.lower() in ("swinunet",):
                     if li_batch is not None:
-                        artifact_map = torch.relu(li_batch - x_batch)
+                        artifact_map = torch.relu(x_batch - li_batch)
                         eps = 1e-6
                         am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
                         artifact_map = artifact_map / (am_max + eps)
-                        pred = model(x_batch, artifact_map=artifact_map)
+                        pred = model(x_batch, artifact_map=artifact_map, artifact_lambda=args.artifact_lambda)
                     else:
-                        pred = model(x_batch, artifact_map=None)
+                        pred = model(x_batch, artifact_map=None, artifact_lambda=args.artifact_lambda)
                 else:
                     if args.input_mode == 'ma_li' and li_batch is not None:
                         x_in = torch.cat([x_batch, li_batch], dim=1)

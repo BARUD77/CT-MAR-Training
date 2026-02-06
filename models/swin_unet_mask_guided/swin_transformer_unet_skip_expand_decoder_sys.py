@@ -73,7 +73,7 @@ def window_reverse(windows, window_size, H, W):
 
 class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
-        Now supports an optional per-window artifact score prior and/or a per-window metal_bias.
+        Now supports an optional per-window artifact score bias and/or a per-window metal_bias.
     """
 
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
@@ -112,19 +112,20 @@ class WindowAttention(nn.Module):
         # learnable global scale for metal bias (helps stability)
         self.register_parameter("metal_scale", nn.Parameter(torch.tensor(1.0, dtype=torch.float32)))
 
-        # Artifact-Aware Self-Attention prior parameters.
-        # Constrained positive in forward via softplus: alpha>0, beta>0, lambda>=0.
+        # Artifact-aware attention bias scale (kept for backwards compatibility with older checkpoints).
+        # If `artifact_lambda` is passed to forward(), it overrides this.
         self.register_parameter("aa_alpha", nn.Parameter(torch.tensor(1.0, dtype=torch.float32)))
         self.register_parameter("aa_beta", nn.Parameter(torch.tensor(1.0, dtype=torch.float32)))
         self.register_parameter("aa_lambda", nn.Parameter(torch.tensor(0.1, dtype=torch.float32)))
 
-    def forward(self, x, mask=None, metal_bias=None, artifact_scores=None):
+    def forward(self, x, mask=None, metal_bias=None, artifact_scores=None, artifact_lambda=None):
         """
         Args:
             x: (num_windows*B, N, C)
             mask: attention mask or None
             metal_bias: optional (num_windows*B, N) tensor with per-token biases (same device/dtype as x)
             artifact_scores: optional (num_windows*B, N) tensor with per-token artifact scores a in [0,1]
+            artifact_lambda: optional scalar (float or 0-d tensor) controlling artifact bias strength.
         """
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -140,22 +141,18 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, N, N
         attn = attn + relative_position_bias.unsqueeze(0)
 
-        # Artifact-aware structured prior term (added to logits BEFORE softmax)
-        # L_ij = Q_i K_j^T / sqrt(d) + lambda * [ alpha * a_i(1-a_j) - beta * a_i a_j ]
+        # Artifact-aware bias term (added to logits BEFORE softmax).
+        # We treat artifact_scores as per-token severity a_j in [0,1] and suppress attending TO
+        # high-artifact key tokens by subtracting lambda * a_j from the logits.
+        # This is a simple bias analogous to metal_bias injection.
         if artifact_scores is not None:
-            a = artifact_scores.to(attn.dtype).to(attn.device)
-            # Expected already normalized; clamp for safety.
-            a = a.clamp(0.0, 1.0)
-            a = a.view(B_, 1, N)  # (B_, 1, N)
-            a_i = a.unsqueeze(-1)  # (B_, 1, N, 1)
-            a_j = a.unsqueeze(-2)  # (B_, 1, 1, N)
-
-            alpha = F.softplus(self.aa_alpha)
-            beta = F.softplus(self.aa_beta)
-            lambda_ = F.softplus(self.aa_lambda)
-
-            prior = alpha * a_i * (1.0 - a_j) - beta * a_i * a_j  # (B_, 1, N, N)
-            attn = attn + lambda_ * prior  # broadcast over heads
+            a = artifact_scores.to(attn.dtype).to(attn.device).clamp(0.0, 1.0)  # (B_, N)
+            if artifact_lambda is None:
+                lam = F.softplus(self.aa_lambda).to(attn.dtype).to(attn.device)
+            else:
+                lam = torch.as_tensor(artifact_lambda, dtype=attn.dtype, device=attn.device)
+            # Bias over key positions (last dim): (B_,1,1,N)
+            attn = attn - (lam * a).view(B_, 1, 1, N)
 
         # metal_bias injection: bias over key positions (last dim)
         if metal_bias is not None:
@@ -243,7 +240,7 @@ class SwinTransformerBlock(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def forward(self, x, artifact_map=None):
+    def forward(self, x, artifact_map=None, artifact_lambda=None):
         """
         x: (B, L, C)
         artifact_map: None or (B, H, W) or (B, 1, H, W)
@@ -290,7 +287,12 @@ class SwinTransformerBlock(nn.Module):
             am_windows = None
 
         # W-MSA / SW-MSA with artifact-aware prior (and optional metal_bias if used elsewhere)
-        attn_windows = self.attn(x_windows, mask=self.attn_mask, artifact_scores=am_windows)
+        attn_windows = self.attn(
+            x_windows,
+            mask=self.attn_mask,
+            artifact_scores=am_windows,
+            artifact_lambda=artifact_lambda,
+        )
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -432,13 +434,13 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, artifact_map_stage=None):
+    def forward(self, x, artifact_map_stage=None, artifact_lambda=None):
         for blk in self.blocks:
             # checkpoint: only use checkpointing when no artifact_map provided (simpler)
             if self.use_checkpoint and artifact_map_stage is None:
                 x = checkpoint.checkpoint(blk, x)
             else:
-                x = blk(x, artifact_map=artifact_map_stage)
+                x = blk(x, artifact_map=artifact_map_stage, artifact_lambda=artifact_lambda)
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -483,12 +485,12 @@ class BasicLayer_up(nn.Module):
         else:
             self.upsample = None
 
-    def forward(self, x, artifact_map_stage=None):
+    def forward(self, x, artifact_map_stage=None, artifact_lambda=None):
         for blk in self.blocks:
             if self.use_checkpoint and artifact_map_stage is None:
                 x = checkpoint.checkpoint(blk, x)
             else:
-                x = blk(x, artifact_map=artifact_map_stage)
+                x = blk(x, artifact_map=artifact_map_stage, artifact_lambda=artifact_lambda)
         if self.upsample is not None:
             x = self.upsample(x)
         return x
@@ -645,7 +647,7 @@ class SwinTransformerSys(nn.Module):
         return {'relative_position_bias_table'}
 
     # Encoder and Bottleneck
-    def forward_features(self, x, artifact_map=None):
+    def forward_features(self, x, artifact_map=None, artifact_lambda=None):
         """
         x: input image tensor (B, C, H_img, W_img)
         artifact_map: optional A_MG tensor (B,1,H_img,W_img) or (B,H_img,W_img)
@@ -678,14 +680,14 @@ class SwinTransformerSys(nn.Module):
             else:
                 am_stage = None
 
-            x = layer(x, artifact_map_stage=am_stage)
+            x = layer(x, artifact_map_stage=am_stage, artifact_lambda=artifact_lambda)
 
         x = self.norm(x)  # B L C
 
         return x, x_downsample
 
     # Decoder and skip connections
-    def forward_up_features(self, x, x_downsample, artifact_map=None):
+    def forward_up_features(self, x, x_downsample, artifact_map=None, artifact_lambda=None):
         """
         x: encoded features (B, L, C)
         x_downsample: list of encoder stage outputs to use as skip (same as original code)
@@ -712,9 +714,9 @@ class SwinTransformerSys(nn.Module):
             x = self.output(x)
         return x
 
-    def forward(self, x, artifact_map=None):
-        x, x_downsample = self.forward_features(x, artifact_map=artifact_map)
-        x = self.forward_up_features(x, x_downsample, artifact_map=artifact_map)
+    def forward(self, x, artifact_map=None, artifact_lambda=None):
+        x, x_downsample = self.forward_features(x, artifact_map=artifact_map, artifact_lambda=artifact_lambda)
+        x = self.forward_up_features(x, x_downsample, artifact_map=artifact_map, artifact_lambda=artifact_lambda)
         x = self.up_x4(x)
         return x
 

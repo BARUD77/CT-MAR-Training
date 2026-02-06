@@ -223,6 +223,11 @@ class CTMetalArtifactDataset(Dataset):
         hu_max: float = 3072.0,
         clip_hu: bool = True,
         output_space: str = "norm",
+        # LI handling: LI files may be stored as linear attenuation (mu) rather than HU.
+        # In this project, LI is always stored as mu, so the default is True.
+        # Set to False only if your LI is already HU on disk.
+        li_is_mu: bool = True,
+        li_mu_water: float = 0.19,
         transform=None,
         # region filter: "all" (default), "body" (only body), "head" (only head)
         region_policy: str = "all",
@@ -241,6 +246,8 @@ class CTMetalArtifactDataset(Dataset):
         self.hu_min, self.hu_max = float(hu_min), float(hu_max)
         self._dr = self.hu_max - self.hu_min
         self.clip_hu = bool(clip_hu)
+        self.li_is_mu = bool(li_is_mu)
+        self.li_mu_water = float(li_mu_water)
         if output_space not in {"norm", "hu"}:
             raise ValueError("output_space must be 'norm' or 'hu'")
         self.output_space = output_space
@@ -338,6 +345,16 @@ class CTMetalArtifactDataset(Dataset):
             raise ValueError(f"Expected 2D array, got {arr.shape} in {path}")
         return arr
 
+    def _li_to_hu(self, li_arr: np.ndarray) -> np.ndarray:
+        """Convert LI array to HU if LI is stored as linear attenuation (mu)."""
+        if not self.li_is_mu:
+            return li_arr
+
+        mu_w = self.li_mu_water
+        if mu_w <= 0:
+            raise ValueError("li_mu_water must be > 0 for mu->HU conversion")
+        return (li_arr / mu_w - 1.0) * 1000.0
+
     def _clip_and_norm01(self, hu: np.ndarray) -> np.ndarray:
         if self.clip_hu:
             hu = np.clip(hu, self.hu_min, self.hu_max)
@@ -362,7 +379,8 @@ class CTMetalArtifactDataset(Dataset):
 
         ma_hu = self._load_npy(os.path.join(self.ma_dir, ma_file)).astype(np.float32)
         gt_hu = self._load_npy(os.path.join(self.gt_dir, gt_file)).astype(np.float32)
-        li_hu = self._load_npy(os.path.join(self.li_dir, li_file)).astype(np.float32)
+        li_raw = self._load_npy(os.path.join(self.li_dir, li_file)).astype(np.float32)
+        li_hu = self._li_to_hu(li_raw)
 
         if self.output_space == "hu":
             ma = self._maybe_clip_hu(ma_hu)
