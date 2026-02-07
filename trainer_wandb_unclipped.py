@@ -340,19 +340,21 @@ def build_model(name: str,
         if not model_cfg_path:
             raise ValueError("SwinUnet requires --model_cfg <path to YAML>.")
         cfg_ns = load_config_namespace(model_cfg_path)
-        # try to inject in_ch to the config if present
+        # try to inject in_ch / num_classes to the config if present
         try:
             cfg_ns.MODEL.SWIN.IN_CHANS = in_ch
         except Exception:
             # ignore if config layout differs
             pass
+        try:
+            cfg_ns.MODEL.SWIN.NUM_CLASSES = int(num_classes)
+        except Exception:
+            # ignore if config layout differs
+            pass
 
-        # Ensure output channels match training target.
-        # The mask-guided SwinUnet wrapper defaults num_classes=21843, which will OOM for 512x512.
-        # Prefer CLI --num_classes unless user explicitly overrides via --model_kwargs.
-        if "num_classes" not in model_kwargs:
-            model_kwargs["num_classes"] = int(num_classes)
-
+        # The non-guided SwinUnet wrapper does not accept num_classes as a kwarg.
+        # It reads NUM_CLASSES from the config instead.
+        model_kwargs.pop("num_classes", None)
         m = SwinUnet(config=cfg_ns, **model_kwargs)
         return m.to(device)
     else:
