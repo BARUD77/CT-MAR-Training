@@ -286,7 +286,7 @@ from torch.utils.data import DataLoader
 
 # NOTE: import path must match your repo layout
 from aapm_dataset import CTMetalArtifactDataset   # patched dataset that returns (x, y, li)
-from models.swin_unet_mask_guided.vision_transformer import SwinUnet
+from models.swin_unet.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
 
 import numpy as np
@@ -388,11 +388,11 @@ def main():
 
     # Data & run setup
     parser.add_argument('--ma_dir', type=str, required=True)
-    parser.add_argument('--li_dir', type=str, required=False, help='Required for artifact guidance / ma_li mode')
+    parser.add_argument('--li_dir', type=str, required=False, help='Directory with LI files (required by the dataset)')
     parser.add_argument('--mask_dir', type=str, required=False, help='Optional: directory with metal masks (metalonlymask files)')
     parser.add_argument('--gt_dir', type=str, required=True)
     parser.add_argument('--input_mode', type=str, choices=['ma_li', 'ma'], default='ma',
-                        help="Use 'ma_li' for using LI guidance. For Swin->single-stream keep MA-only input but pass LI as artifact_map.")
+                        help="Use 'ma_li' to concatenate MA+LI as 2-channel input, or 'ma' for MA-only input.")
     parser.add_argument('--num_classes', type=int, default=1, help='Output channels/classes')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=4,
@@ -406,12 +406,6 @@ def main():
     parser.add_argument('--region_policy', type=str, default='all', choices=['all','body','head'],
                         help='Region filter passed to dataset (defaults to "all").')
 
-    # Artifact-aware attention bias strength (runtime override).
-    # If not set, the model uses its internal aa_lambda parameter.
-    parser.add_argument('--artifact_lambda', type=float, default=None,
-                        help='Optional override for artifact-aware attention bias strength. '
-                             'If omitted, uses the model\'s internal aa_lambda. Set 0 to disable.')
-
     # Intensity window (HU) used for clipping/normalization inside the dataset
     parser.add_argument('--hu_min', type=float, default=-1024.0, help='Minimum HU for clipping before normalization')
     parser.add_argument('--hu_max', type=float, default=3072.0, help='Maximum HU for clipping before normalization')
@@ -419,9 +413,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate LI path when input_mode=ma_li
-    if args.input_mode == 'ma_li' and not args.li_dir:
-        raise ValueError("input_mode='ma_li' requires --li_dir (LI guidance files).")
+    # Dataset requires LI files for all modes (LI may be ignored by the model in MA-only mode)
+    if not args.li_dir:
+        raise ValueError("--li_dir is required by the dataset (LI files are always loaded).")
 
     os.makedirs(args.log_dir, exist_ok=True)
 
@@ -438,14 +432,10 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Decide input channels to pass to model builder:
-    # - For SwinUnet + artifact guidance we will use single-stream input (MA only) and pass LI separately
-    # - For vanilla UNet if input_mode=='ma_li' we will concatenate MA and LI -> in_ch = 2
-    if args.model.lower() in ("swinunet",):
-        # We use single-stream MA input. Model will receive artifact_map via forward call.
-        in_ch = 1
-    else:
-        in_ch = 2 if args.input_mode == 'ma_li' else 1
+    # Decide input channels to pass to model builder
+    # - input_mode='ma_li' -> 2-channel input [MA, LI]
+    # - input_mode='ma'    -> 1-channel input [MA]
+    in_ch = 2 if args.input_mode == 'ma_li' else 1
 
     # ---------------- Build model ----------------
     model = build_model(
@@ -543,29 +533,15 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Model-specific forward:
-            if args.model.lower() in ("swinunet",):
-                # SwinUnet accepts (x, artifact_map=...) in our patched implementation.
-                # Ensure we pass MA-only as input (x_batch should be single channel).
-                if args.input_mode == 'ma_li':
-                    # Compute soft artifact map per paper:
-                    #   A_MG = max(x_MA - x_LI, 0)
-                    # then normalize A_MG to [0,1].
-                    # Shapes: x_batch (B,1,H,W), li_batch (B,1,H,W)
-                    artifact_map = torch.relu(x_batch - li_batch)
-                    eps = 1e-6
-                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
-                    artifact_map = artifact_map / (am_max + eps)
-                    pred = model(x_batch, artifact_map=artifact_map, artifact_lambda=args.artifact_lambda)
-                else:
-                    pred = model(x_batch, artifact_map=None, artifact_lambda=args.artifact_lambda)
+            # Build input tensor based on input_mode
+            if args.input_mode == 'ma_li':
+                if li_batch is None:
+                    raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li_batch is None.")
+                x_in = torch.cat([x_batch, li_batch], dim=1)
             else:
-                # vanilla UNet: if li present and input_mode 'ma_li', concatenate channels
-                if args.input_mode == 'ma_li' and li_batch is not None:
-                    x_in = torch.cat([x_batch, li_batch], dim=1)  # concat along channel dim
-                else:
-                    x_in = x_batch
-                pred = model(x_in)
+                x_in = x_batch
+
+            pred = model(x_in)
 
             loss = loss_fn(pred, y_batch)
             loss.backward()
@@ -642,21 +618,13 @@ def main():
                 if li_hu is not None:
                     li_hu = li_hu.to(device, non_blocking=True)
 
-                if args.model.lower() in ("swinunet",):
-                    if li_batch is not None:
-                        artifact_map = torch.relu(x_batch - li_batch)
-                        eps = 1e-6
-                        am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
-                        artifact_map = artifact_map / (am_max + eps)
-                        pred = model(x_batch, artifact_map=artifact_map, artifact_lambda=args.artifact_lambda)
-                    else:
-                        pred = model(x_batch, artifact_map=None, artifact_lambda=args.artifact_lambda)
+                if args.input_mode == 'ma_li':
+                    if li_batch is None:
+                        raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li_batch is None.")
+                    x_in = torch.cat([x_batch, li_batch], dim=1)
                 else:
-                    if args.input_mode == 'ma_li' and li_batch is not None:
-                        x_in = torch.cat([x_batch, li_batch], dim=1)
-                    else:
-                        x_in = x_batch
-                    pred = model(x_in)
+                    x_in = x_batch
+                pred = model(x_in)
 
                 # Normalized metrics are computed on clamped [0,1] tensors.
                 pred_eval = torch.clamp(pred, 0, 1)
