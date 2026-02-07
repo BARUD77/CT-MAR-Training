@@ -415,9 +415,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Dataset requires LI files for all modes (LI may be ignored by the model in MA-only mode)
-    if not args.li_dir:
-        raise ValueError("--li_dir is required by the dataset (LI files are always loaded).")
+    # LI is required only for ma_li mode
+    if args.input_mode == 'ma_li' and not args.li_dir:
+        raise ValueError("input_mode='ma_li' requires --li_dir (LI files).")
 
     os.makedirs(args.log_dir, exist_ok=True)
 
