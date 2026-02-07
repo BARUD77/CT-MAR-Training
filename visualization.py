@@ -11,7 +11,7 @@ import wandb
 
 # Your modules
 from test_dataset import CTMetalArtifactDataset as CTDatasetLegacy
-from models.swin_unet_mask_guided.vision_transformer import SwinUnet
+from models.swin_unet.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
 from types import SimpleNamespace
 import yaml
@@ -95,7 +95,7 @@ def load_model(model_name, device, in_ch, config_path=None):
         except AttributeError:
             # If cfg structure differs, fall back to passing num_classes explicitly
             pass
-        model = SwinUnet(config=cfg, num_classes=1).to(device)
+        model = SwinUnet(config=cfg).to(device)
     elif model_name == 'unet':
         try:
             model = UnetGenerator(in_ch=in_ch).to(device)
@@ -186,7 +186,8 @@ def main():
 
     # Model / ckpt (for mode=from_model)
     p.add_argument('--model', choices=['unet','swinunet'], default='unet')
-    p.add_argument('--in_ch', type=int, default=1)
+    p.add_argument('--input_mode', type=str, choices=['ma','ma_li'], default='ma',
+                   help="'ma' uses MA only (1 channel). 'ma_li' concatenates [MA, LI] (2 channels).")
     p.add_argument('--config', type=str, help='SwinUnet config path (if using swinunet)')
     p.add_argument('--ckpt', type=str, help='Path to .pt checkpoint')
 
@@ -210,6 +211,9 @@ def main():
     p.add_argument('--run_name', type=str, default='viz')
     p.add_argument('--log_to_wandb', action='store_true')
     args = p.parse_args()
+
+    if args.input_mode == 'ma_li' and args.li_dir is None:
+        raise ValueError("input_mode='ma_li' requires --li_dir")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -238,8 +242,8 @@ def main():
             raise ValueError("--ma_dir and --gt_dir are required for mode=from_model")
 
         # dataset returns normalized [0,1] tensors (1,H,W)
-        # If LI guidance is provided, prefer the aapm_dataset that returns (x,y,li)
-        if args.li_dir is not None:
+        # If using 2-channel input, we need LI from aapm_dataset.
+        if args.input_mode == 'ma_li':
             from aapm_dataset import CTMetalArtifactDataset
             ds_full = CTMetalArtifactDataset(
                 ma_dir=args.ma_dir, gt_dir=args.gt_dir, li_dir=args.li_dir,
@@ -264,7 +268,8 @@ def main():
                             pin_memory=(device.type == 'cuda'))
 
         # load model
-        model = load_model(args.model, device, in_ch=args.in_ch, config_path=args.config)
+        in_ch = 2 if args.input_mode == 'ma_li' else 1
+        model = load_model(args.model, device, in_ch=in_ch, config_path=args.config)
         if args.ckpt:
             try:
                 load_checkpoint(model, args.ckpt, device)
@@ -280,30 +285,25 @@ def main():
                 li = None
                 if isinstance(batch, (list, tuple)) and len(batch) == 3:
                     x, y, third = batch
-                    # If user provided --li_dir we expect the third element to be LI
-                    if args.li_dir is not None:
+                    # If using 2ch mode, the third element is LI
+                    if args.input_mode == 'ma_li':
                         x, y, li = x, y, third
-                    else:
-                        x, y = x, y
                 else:
                     x, y = batch
 
                 x = x.to(device, non_blocking=True)   # (B,1,H,W)
                 y = y.to(device, non_blocking=True)
 
-                # If using swinunet + LI guidance, compute artifact_map from (li - ma)
-                if args.model == 'swinunet' and li is not None:
+                # Forward: build model input based on input_mode
+                if args.input_mode == 'ma_li':
+                    if li is None:
+                        raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li is None.")
                     li = li.to(device, non_blocking=True)
-                    artifact_map = torch.relu(li - x)
-                    # normalize per-sample to [0,1] (avoid division by zero)
-                    B = artifact_map.size(0)
-                    for ii in range(B):
-                        mmax = float(artifact_map[ii].max())
-                        if mmax > 0:
-                            artifact_map[ii] = artifact_map[ii] / mmax
-                    pred = model(x, artifact_map=artifact_map)
+                    x_in = torch.cat([x, li], dim=1)
                 else:
-                    pred = model(x)
+                    x_in = x
+
+                pred = model(x_in)
                 pred_eval = torch.clamp(pred, 0, 1)   # ensure [0,1]
                 gt_eval   = torch.clamp(y,   0, 1)
 

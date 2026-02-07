@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from torch.utils.data import DataLoader
 
 from aapm_dataset import CTMetalArtifactDataset
-from models.swin_unet_mask_guided.vision_transformer import SwinUnet
+from models.swin_unet.vision_transformer import SwinUnet
 from models.unet import UnetGenerator
 from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM
 import numpy as np
@@ -72,10 +72,15 @@ def load_model(args, device, in_ch):
             config.MODEL.SWIN.IN_CHANS = in_ch
         except AttributeError:
             pass
+        # ensure output channels match target
+        try:
+            config.MODEL.SWIN.NUM_CLASSES = int(args.num_classes)
+        except AttributeError:
+            pass
 
         model_kwargs = parse_json_or_none(args.model_kwargs) or {}
-        # Ensure output channels match target unless user overrides.
-        model_kwargs.setdefault("num_classes", int(args.num_classes))
+        # Non-guided SwinUnet wrapper reads channels/classes from config.
+        model_kwargs.pop("num_classes", None)
         model = SwinUnet(config=config, **model_kwargs).to(device)
     else:
         model_kwargs = parse_json_or_none(args.model_kwargs) or {}
@@ -89,7 +94,7 @@ def main():
     p.add_argument('--model_kwargs', type=str, default=None,
                    help='Optional JSON dict of kwargs for the chosen model. Example: "{\\"num_classes\\":1}"')
     p.add_argument('--ma_dir', type=str, required=True)
-    p.add_argument('--li_dir', type=str, required=False, help='Required for input_mode=ma_li (guidance)')
+    p.add_argument('--li_dir', type=str, required=False, help='Required for input_mode=ma_li (2-channel input)')
     p.add_argument('--gt_dir', type=str, required=True)
     p.add_argument('--mask_dir', type=str, default=None, help='Optional metal-only mask dir (enables masked SSIM + score HU SSIM)')
     p.add_argument('--split', type=str, choices=['train','val','test'], default='train')
@@ -127,12 +132,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Match training behavior:
-    # - SwinUnet (mask-guided): MA-only input, LI used only to build artifact_map
-    # - UNet: MA-only or [MA,LI] concatenation
-    if args.model == 'swinunet':
-        in_ch = 1
-    else:
-        in_ch = 2 if args.input_mode == 'ma_li' else 1
+    # - input_mode='ma'    -> MA-only input (1 channel)
+    # - input_mode='ma_li' -> concatenate [MA, LI] (2 channels)
+    in_ch = 2 if args.input_mode == 'ma_li' else 1
 
     model = load_model(args, device, in_ch=in_ch)
 
@@ -143,11 +145,10 @@ def main():
     model.eval()
 
     # Dataset & loaders
-    # NOTE: aapm_dataset.CTMetalArtifactDataset requires LI to exist on disk.
     ds = CTMetalArtifactDataset(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
-        li_dir=args.li_dir,
+        li_dir=args.li_dir if args.input_mode == 'ma_li' else None,
         mask_dir=args.mask_dir,
         split=args.split,
         val_size=0.0,
@@ -159,7 +160,7 @@ def main():
     ds_hu = CTMetalArtifactDataset(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
-        li_dir=args.li_dir,
+        li_dir=args.li_dir if args.input_mode == 'ma_li' else None,
         mask_dir=args.mask_dir,
         split=args.split,
         val_size=0.0,
@@ -201,24 +202,16 @@ def main():
             if mask is not None:
                 mask = mask.to(device, non_blocking=True)
 
-            # Forward
-            if args.model == 'swinunet':
-                if li is not None:
-                    li = li.to(device, non_blocking=True)
-                    artifact_map = torch.relu(li - x)
-                    eps = 1e-6
-                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
-                    artifact_map = artifact_map / (am_max + eps)
-                    pred = model(x, artifact_map=artifact_map)
-                else:
-                    pred = model(x, artifact_map=None)
+            # Forward: build input tensor based on input_mode
+            if args.input_mode == 'ma_li':
+                if li is None:
+                    raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li is None.")
+                li = li.to(device, non_blocking=True)
+                x_in = torch.cat([x, li], dim=1)
             else:
-                if args.input_mode == 'ma_li' and li is not None:
-                    li = li.to(device, non_blocking=True)
-                    x_in = torch.cat([x, li], dim=1)
-                else:
-                    x_in = x
-                pred = model(x_in)
+                x_in = x
+
+            pred = model(x_in)
 
             pred_eval = torch.clamp(pred, 0, 1)
             gt_eval   = torch.clamp(y,   0, 1)
