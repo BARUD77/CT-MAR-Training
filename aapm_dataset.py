@@ -213,7 +213,7 @@ class CTMetalArtifactDataset(Dataset):
         self,
         ma_dir: str,
         gt_dir: str,
-        li_dir: str,
+        li_dir: str | None = None,
         mask_dir: str | None = None,
         split: str = "train",          # {"train","val"}
         val_size: float = 0.1,
@@ -236,8 +236,7 @@ class CTMetalArtifactDataset(Dataset):
         assert 0.0 <= val_size < 1.0
         assert hu_max > hu_min
         assert region_policy in {"all", "body", "head"}
-        if li_dir is None:
-            raise ValueError("li_dir must be provided for artifact-guided training (LI is required).")
+        # LI is optional for MA-only training
 
         self.ma_dir, self.gt_dir, self.li_dir = ma_dir, gt_dir, li_dir
         self.mask_dir = mask_dir
@@ -281,11 +280,12 @@ class CTMetalArtifactDataset(Dataset):
                 key = (m.group(1).lower(), int(m.group(3)))
                 gt_map[key] = f
 
-        for f in list_npy(li_dir):
-            m = rx.match(f)
-            if m and m.group(2).lower() == "li":
-                key = (m.group(1).lower(), int(m.group(3)))
-                li_map[key] = f
+        if li_dir is not None:
+            for f in list_npy(li_dir):
+                m = rx.match(f)
+                if m and m.group(2).lower() == "li":
+                    key = (m.group(1).lower(), int(m.group(3)))
+                    li_map[key] = f
 
         # optional metal-only masks
         if mask_dir is not None:
@@ -295,8 +295,10 @@ class CTMetalArtifactDataset(Dataset):
                     key = (m.group(1).lower(), int(m.group(3)))
                     mask_map[key] = f
 
-        # Intersect keys present in required modalities (MA, GT, LI)
-        keys = sorted(set(ma_map) & set(gt_map) & set(li_map))
+        # Intersect keys present in required modalities (MA, GT, and optional LI)
+        keys = sorted(set(ma_map) & set(gt_map))
+        if li_dir is not None:
+            keys = sorted(set(keys) & set(li_map))
         # If mask_dir provided, require mask to be present as well
         if mask_dir is not None:
             keys = sorted(set(keys) & set(mask_map))
@@ -315,9 +317,15 @@ class CTMetalArtifactDataset(Dataset):
         triplets_all = []
         for key in keys:
             if mask_dir is not None:
-                triplets_all.append((ma_map[key], gt_map[key], mask_map[key], li_map[key]))
+                if li_dir is not None:
+                    triplets_all.append((ma_map[key], gt_map[key], mask_map[key], li_map[key]))
+                else:
+                    triplets_all.append((ma_map[key], gt_map[key], mask_map[key]))
             else:
-                triplets_all.append((ma_map[key], gt_map[key], li_map[key]))
+                if li_dir is not None:
+                    triplets_all.append((ma_map[key], gt_map[key], li_map[key]))
+                else:
+                    triplets_all.append((ma_map[key], gt_map[key]))
 
         # Train/Val split (test uses the full set)
         if split == "test":
@@ -369,31 +377,44 @@ class CTMetalArtifactDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx: int):
-        # Support pairs of length 3: (ma, gt, li) and length 4: (ma, gt, mask, li)
+        # Support pairs of length 2/3/4: (ma, gt), (ma, gt, li) or (ma, gt, mask), (ma, gt, mask, li)
         entry = self.pairs[idx]
-        if len(entry) == 3:
-            ma_file, gt_file, li_file = entry
+        if len(entry) == 2:
+            ma_file, gt_file = entry
             mask_file = None
+            li_file = None
+        elif len(entry) == 3:
+            ma_file, gt_file, third = entry
+            # If LI is optional, the third could be a mask or LI.
+            # We disambiguate by filename containing 'metalonlymask' vs 'li'.
+            if "metalonlymask" in third.lower():
+                mask_file = third
+                li_file = None
+            else:
+                mask_file = None
+                li_file = third
         else:
             ma_file, gt_file, mask_file, li_file = entry
 
         ma_hu = self._load_npy(os.path.join(self.ma_dir, ma_file)).astype(np.float32)
         gt_hu = self._load_npy(os.path.join(self.gt_dir, gt_file)).astype(np.float32)
-        li_raw = self._load_npy(os.path.join(self.li_dir, li_file)).astype(np.float32)
-        li_hu = self._li_to_hu(li_raw)
+        li_hu = None
+        if li_file is not None and self.li_dir is not None:
+            li_raw = self._load_npy(os.path.join(self.li_dir, li_file)).astype(np.float32)
+            li_hu = self._li_to_hu(li_raw)
 
         if self.output_space == "hu":
             ma = self._maybe_clip_hu(ma_hu)
             gt = self._maybe_clip_hu(gt_hu)
-            li = self._maybe_clip_hu(li_hu)
+            li = self._maybe_clip_hu(li_hu) if li_hu is not None else None
         else:
             ma = self._clip_and_norm01(ma_hu)
             gt = self._clip_and_norm01(gt_hu)
-            li = self._clip_and_norm01(li_hu)
+            li = self._clip_and_norm01(li_hu) if li_hu is not None else None
 
         x = torch.from_numpy(ma).unsqueeze(0).float()   # MA input
         y = torch.from_numpy(gt).unsqueeze(0).float()   # GT target
-        li_t = torch.from_numpy(li).unsqueeze(0).float()# LI guidance map
+        li_t = torch.from_numpy(li).unsqueeze(0).float() if li is not None else None
 
         m_t = None
         if mask_file is not None:
@@ -406,12 +427,17 @@ class CTMetalArtifactDataset(Dataset):
         if self.transform:
             x = self.transform(x)
             y = self.transform(y)
-            li_t = self.transform(li_t)
+            if li_t is not None:
+                li_t = self.transform(li_t)
             if m_t is not None:
                 m_t = self.transform(m_t)
 
-        # Return (x, y, li) or (x, y, mask, li)
-        if m_t is not None:
+        # Return (x, y) / (x, y, li) / (x, y, mask) / (x, y, mask, li)
+        if m_t is not None and li_t is not None:
             return x, y, m_t, li_t
-        return x, y, li_t
+        if m_t is not None:
+            return x, y, m_t
+        if li_t is not None:
+            return x, y, li_t
+        return x, y
 
