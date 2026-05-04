@@ -271,24 +271,40 @@ def main():
 
             idx_base += B
 
-    avg_ssim = float(np.mean(ssim_list)) if len(ssim_list) else 0.0
-    avg_psnr = float(np.mean(psnr_list)) if len(psnr_list) else 0.0
-    avg_rmse = float(np.mean(rmse_list)) if len(rmse_list) else 0.0
-    avg_masked_ssim = float(np.mean(masked_ssim_list)) if len(masked_ssim_list) else 0.0
-    avg_score_hu_ssim = float(np.mean(score_hu_ssim_list)) if len(score_hu_ssim_list) else 0.0
+    def _mean_std(vals):
+        if not len(vals):
+            return 0.0, 0.0
+        m = float(np.mean(vals))
+        s = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+        return m, s
+
+    avg_ssim, std_ssim = _mean_std(ssim_list)
+    avg_psnr, std_psnr = _mean_std(psnr_list)
+    avg_rmse, std_rmse = _mean_std(rmse_list)
+    avg_masked_ssim, std_masked_ssim = _mean_std(masked_ssim_list)
+    avg_score_hu_ssim, std_score_hu_ssim = _mean_std(score_hu_ssim_list)
 
     print(
-        f"[EVAL] {args.split} | SSIM: {avg_ssim:.4f} | PSNR: {avg_psnr:.2f} dB | RMSE: {avg_rmse:.6f} "
-        f"| masked_SSIM: {avg_masked_ssim:.4f} | score_hu_ssim: {avg_score_hu_ssim:.4f}"
+        f"[EVAL] {args.split} "
+        f"| SSIM: {avg_ssim:.4f} ± {std_ssim:.4f} "
+        f"| PSNR: {avg_psnr:.2f} ± {std_psnr:.2f} dB "
+        f"| RMSE: {avg_rmse:.6f} ± {std_rmse:.6f} "
+        f"| masked_SSIM: {avg_masked_ssim:.4f} ± {std_masked_ssim:.4f} "
+        f"| score_hu_ssim: {avg_score_hu_ssim:.4f} ± {std_score_hu_ssim:.4f}"
     )
 
     if use_wandb:
         wandb.log({
             "eval/ssim_mean": avg_ssim,
+            "eval/ssim_std": std_ssim,
             "eval/psnr_mean": avg_psnr,
+            "eval/psnr_std": std_psnr,
             "eval/rmse_mean": avg_rmse,
+            "eval/rmse_std": std_rmse,
             "eval/masked_ssim_mean": avg_masked_ssim,
+            "eval/masked_ssim_std": std_masked_ssim,
             "eval/score_hu_ssim_mean": avg_score_hu_ssim,
+            "eval/score_hu_ssim_std": std_score_hu_ssim,
             "eval/ssim_hist": wandb.Histogram(ssim_list),
             "eval/psnr_hist": wandb.Histogram(psnr_list),
             "eval/rmse_hist": wandb.Histogram(rmse_list),
