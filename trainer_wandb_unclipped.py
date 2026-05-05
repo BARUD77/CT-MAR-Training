@@ -288,6 +288,7 @@ from torch.utils.data import DataLoader
 from aapm_dataset import CTMetalArtifactDataset   # patched dataset that returns (x, y, li)
 from models.swin_unet.vision_transformer import SwinUnet
 from models.swin_unet_feature_gating.vision_transformer import SwinUnet as SwinUnetFG
+from models.swin_unet_three_channel.vision_transformer import SwinUnet as SwinUnet3Ch
 from models.unet import UnetGenerator
 
 import numpy as np
@@ -374,8 +375,23 @@ def build_model(name: str,
         model_kwargs.pop("num_classes", None)
         m = SwinUnetFG(config=cfg_ns, **model_kwargs)
         return m.to(device)
+    elif name in ("swinunet_3ch", "swin_unet_3ch", "swinunet-3ch", "three_channel"):
+        if not model_cfg_path:
+            raise ValueError("SwinUnet (3-channel) requires --model_cfg <path to YAML>.")
+        cfg_ns = load_config_namespace(model_cfg_path)
+        try:
+            cfg_ns.MODEL.SWIN.IN_CHANS = in_ch  # expected to be 3 for [MA, LI, A_MG]
+        except Exception:
+            pass
+        try:
+            cfg_ns.MODEL.SWIN.NUM_CLASSES = int(num_classes)
+        except Exception:
+            pass
+        model_kwargs.pop("num_classes", None)
+        m = SwinUnet3Ch(config=cfg_ns, **model_kwargs)
+        return m.to(device)
     else:
-        raise ValueError(f"Unknown model: {name}. Supported: unet, swinunet, swinunet_fg")
+        raise ValueError(f"Unknown model: {name}. Supported: unet, swinunet, swinunet_fg, swinunet_3ch")
 
 def param_groups(model, wd, nowd_names=('bias', 'bn', 'norm')):
     decay, no_decay = [], []
@@ -396,7 +412,7 @@ def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
     # Model selection / config
     parser.add_argument('--model', type=str,
-                        choices=['unet', 'swinunet', 'swinunet_fg'],
+                        choices=['unet', 'swinunet', 'swinunet_fg', 'swinunet_3ch'],
                         required=True,
                         help="Pick an architecture from the registry.")
     parser.add_argument('--model_cfg', type=str, default=None,
@@ -435,10 +451,13 @@ def main():
     # LI is required for ma_li mode and for the feature-gating Swin-UNet
     # (which uses LI to build the soft artifact map A_MG).
     is_swin_fg = args.model.lower() in ("swinunet_fg", "swin_unet_fg", "swinunet-fg", "feature_gating")
+    is_swin_3ch = args.model.lower() in ("swinunet_3ch", "swin_unet_3ch", "swinunet-3ch", "three_channel")
     if args.input_mode == 'ma_li' and not args.li_dir:
         raise ValueError("input_mode='ma_li' requires --li_dir (LI files).")
     if is_swin_fg and not args.li_dir:
         raise ValueError("--model swinunet_fg requires --li_dir (LI files) to build the artifact map.")
+    if is_swin_3ch and not args.li_dir:
+        raise ValueError("--model swinunet_3ch requires --li_dir (LI files) to build the [MA, LI, A_MG] input.")
 
     os.makedirs(args.log_dir, exist_ok=True)
 
@@ -457,10 +476,13 @@ def main():
 
     # Decide input channels to pass to model builder
     # - swinunet_fg          -> single-stream MA input (1ch); LI is used as artifact_map
+    # - swinunet_3ch         -> 3-channel input [MA, LI, A_MG]
     # - input_mode='ma_li'   -> 2-channel input [MA, LI] (vanilla UNet / plain SwinUnet)
     # - input_mode='ma'      -> 1-channel input [MA]
     if is_swin_fg:
         in_ch = 1
+    elif is_swin_3ch:
+        in_ch = 3
     else:
         in_ch = 2 if args.input_mode == 'ma_li' else 1
 
@@ -484,8 +506,8 @@ def main():
     dataset_kwargs = dict(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
-        # LI is loaded whenever input_mode is ma_li OR we're running the feature-gating Swin-UNet.
-        li_dir=args.li_dir if (args.input_mode == 'ma_li' or is_swin_fg) else None,
+        # LI is loaded whenever input_mode is ma_li OR we're running a model that needs LI.
+        li_dir=args.li_dir if (args.input_mode == 'ma_li' or is_swin_fg or is_swin_3ch) else None,
         mask_dir=args.mask_dir,
         split='train',
         hu_min=float(args.hu_min),
@@ -570,6 +592,15 @@ def main():
                 am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
                 artifact_map = artifact_map / (am_max + 1e-6)
                 pred = model(x_batch, artifact_map=artifact_map)
+            elif is_swin_3ch:
+                # 3-channel input: [MA, LI, A_MG]
+                if li_batch is None:
+                    raise RuntimeError("swinunet_3ch requires LI in the batch, but li_batch is None.")
+                artifact_map = torch.relu(li_batch - x_batch)
+                am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                artifact_map = artifact_map / (am_max + 1e-6)
+                x_in = torch.cat([x_batch, li_batch, artifact_map], dim=1)
+                pred = model(x_in)
             else:
                 if args.input_mode == 'ma_li':
                     if li_batch is None:
@@ -667,6 +698,14 @@ def main():
                     am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
                     artifact_map = artifact_map / (am_max + 1e-6)
                     pred = model(x_batch, artifact_map=artifact_map)
+                elif is_swin_3ch:
+                    if li_batch is None:
+                        raise RuntimeError("swinunet_3ch requires LI in the batch, but li_batch is None.")
+                    artifact_map = torch.relu(li_batch - x_batch)
+                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                    artifact_map = artifact_map / (am_max + 1e-6)
+                    x_in = torch.cat([x_batch, li_batch, artifact_map], dim=1)
+                    pred = model(x_in)
                 else:
                     pred = model(x_in)
 
