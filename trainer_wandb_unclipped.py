@@ -287,6 +287,7 @@ from torch.utils.data import DataLoader
 # NOTE: import path must match your repo layout
 from aapm_dataset import CTMetalArtifactDataset   # patched dataset that returns (x, y, li)
 from models.swin_unet.vision_transformer import SwinUnet
+from models.swin_unet_feature_gating.vision_transformer import SwinUnet as SwinUnetFG
 from models.unet import UnetGenerator
 
 import numpy as np
@@ -357,8 +358,24 @@ def build_model(name: str,
         model_kwargs.pop("num_classes", None)
         m = SwinUnet(config=cfg_ns, **model_kwargs)
         return m.to(device)
+    elif name in ("swinunet_fg", "swin_unet_fg", "swinunet-fg", "feature_gating"):
+        if not model_cfg_path:
+            raise ValueError("SwinUnet (feature gating) requires --model_cfg <path to YAML>.")
+        cfg_ns = load_config_namespace(model_cfg_path)
+        try:
+            cfg_ns.MODEL.SWIN.IN_CHANS = in_ch
+        except Exception:
+            pass
+        try:
+            cfg_ns.MODEL.SWIN.NUM_CLASSES = int(num_classes)
+        except Exception:
+            pass
+        # Wrapper reads NUM_CLASSES from the config; same shape as plain swinunet.
+        model_kwargs.pop("num_classes", None)
+        m = SwinUnetFG(config=cfg_ns, **model_kwargs)
+        return m.to(device)
     else:
-        raise ValueError(f"Unknown model: {name}. Supported: unet, swinunet")
+        raise ValueError(f"Unknown model: {name}. Supported: unet, swinunet, swinunet_fg")
 
 def param_groups(model, wd, nowd_names=('bias', 'bn', 'norm')):
     decay, no_decay = [], []
@@ -379,7 +396,7 @@ def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
     # Model selection / config
     parser.add_argument('--model', type=str,
-                        choices=['unet', 'swinunet'],
+                        choices=['unet', 'swinunet', 'swinunet_fg'],
                         required=True,
                         help="Pick an architecture from the registry.")
     parser.add_argument('--model_cfg', type=str, default=None,
@@ -415,9 +432,13 @@ def main():
 
     args = parser.parse_args()
 
-    # LI is required only for ma_li mode
+    # LI is required for ma_li mode and for the feature-gating Swin-UNet
+    # (which uses LI to build the soft artifact map A_MG).
+    is_swin_fg = args.model.lower() in ("swinunet_fg", "swin_unet_fg", "swinunet-fg", "feature_gating")
     if args.input_mode == 'ma_li' and not args.li_dir:
         raise ValueError("input_mode='ma_li' requires --li_dir (LI files).")
+    if is_swin_fg and not args.li_dir:
+        raise ValueError("--model swinunet_fg requires --li_dir (LI files) to build the artifact map.")
 
     os.makedirs(args.log_dir, exist_ok=True)
 
@@ -435,9 +456,13 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Decide input channels to pass to model builder
-    # - input_mode='ma_li' -> 2-channel input [MA, LI]
-    # - input_mode='ma'    -> 1-channel input [MA]
-    in_ch = 2 if args.input_mode == 'ma_li' else 1
+    # - swinunet_fg          -> single-stream MA input (1ch); LI is used as artifact_map
+    # - input_mode='ma_li'   -> 2-channel input [MA, LI] (vanilla UNet / plain SwinUnet)
+    # - input_mode='ma'      -> 1-channel input [MA]
+    if is_swin_fg:
+        in_ch = 1
+    else:
+        in_ch = 2 if args.input_mode == 'ma_li' else 1
 
     # ---------------- Build model ----------------
     model = build_model(
@@ -459,7 +484,8 @@ def main():
     dataset_kwargs = dict(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
-        li_dir=args.li_dir if args.input_mode == 'ma_li' else None,
+        # LI is loaded whenever input_mode is ma_li OR we're running the feature-gating Swin-UNet.
+        li_dir=args.li_dir if (args.input_mode == 'ma_li' or is_swin_fg) else None,
         mask_dir=args.mask_dir,
         split='train',
         hu_min=float(args.hu_min),
@@ -535,15 +561,23 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Build input tensor based on input_mode
-            if args.input_mode == 'ma_li':
+            # Build input tensor based on model + input_mode
+            if is_swin_fg:
+                # Single-stream MA input; pass A_MG = normalize(relu(LI - MA)) as artifact_map.
                 if li_batch is None:
-                    raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li_batch is None.")
-                x_in = torch.cat([x_batch, li_batch], dim=1)
+                    raise RuntimeError("swinunet_fg requires LI in the batch, but li_batch is None.")
+                artifact_map = torch.relu(li_batch - x_batch)
+                am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                artifact_map = artifact_map / (am_max + 1e-6)
+                pred = model(x_batch, artifact_map=artifact_map)
             else:
-                x_in = x_batch
-
-            pred = model(x_in)
+                if args.input_mode == 'ma_li':
+                    if li_batch is None:
+                        raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li_batch is None.")
+                    x_in = torch.cat([x_batch, li_batch], dim=1)
+                else:
+                    x_in = x_batch
+                pred = model(x_in)
 
             loss = loss_fn(pred, y_batch)
             loss.backward()
@@ -555,9 +589,9 @@ def main():
 
         # ---------------- Validation ----------------
         model.eval()
-        total_ssim = 0.0
-        total_psnr = 0.0
-        total_rmse = 0.0
+        ssim_list = []
+        psnr_list = []
+        rmse_list = []
         total_masked_ssim = 0.0
         total_score_hu_ssim = 0.0
         total_li_gt_hu_ssim = 0.0
@@ -626,7 +660,15 @@ def main():
                     x_in = torch.cat([x_batch, li_batch], dim=1)
                 else:
                     x_in = x_batch
-                pred = model(x_in)
+                if is_swin_fg:
+                    if li_batch is None:
+                        raise RuntimeError("swinunet_fg requires LI in the batch, but li_batch is None.")
+                    artifact_map = torch.relu(li_batch - x_batch)
+                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                    artifact_map = artifact_map / (am_max + 1e-6)
+                    pred = model(x_batch, artifact_map=artifact_map)
+                else:
+                    pred = model(x_in)
 
                 # Normalized metrics are computed on clamped [0,1] tensors.
                 pred_eval = torch.clamp(pred, 0, 1)
@@ -636,9 +678,9 @@ def main():
                 for i in range(pred_eval.size(0)):
                     img_pred = pred_eval[i, 0]
                     img_gt = gt_eval[i, 0]
-                    total_ssim += compute_SSIM(img_pred, img_gt, data_range=1.0)
-                    total_psnr += compute_PSNR(img_pred, img_gt, data_range=1.0)
-                    total_rmse += compute_RMSE(img_pred, img_gt)
+                    ssim_list.append(float(compute_SSIM(img_pred, img_gt, data_range=1.0)))
+                    psnr_list.append(float(compute_PSNR(img_pred, img_gt, data_range=1.0)))
+                    rmse_list.append(float(compute_RMSE(img_pred, img_gt)))
 
                     # compute masked SSIM: treat dataset mask as metal mask (set metals to normalized 100HU)
                     metalmask_arg = None
@@ -692,9 +734,12 @@ def main():
                             )
                             total_li_gt_hu_ssim += li_gt_hu_val
 
-        avg_psnr = total_psnr / len(val_ds)
-        avg_ssim = total_ssim / len(val_ds)
-        avg_rmse = total_rmse / len(val_ds)
+        avg_psnr = float(np.mean(psnr_list)) if psnr_list else 0.0
+        avg_ssim = float(np.mean(ssim_list)) if ssim_list else 0.0
+        avg_rmse = float(np.mean(rmse_list)) if rmse_list else 0.0
+        std_psnr = float(np.std(psnr_list, ddof=1)) if len(psnr_list) > 1 else 0.0
+        std_ssim = float(np.std(ssim_list, ddof=1)) if len(ssim_list) > 1 else 0.0
+        std_rmse = float(np.std(rmse_list, ddof=1)) if len(rmse_list) > 1 else 0.0
         avg_masked_ssim = total_masked_ssim / len(val_ds)
         avg_score_hu_ssim = total_score_hu_ssim / len(val_ds)
         avg_li_gt_hu_ssim = total_li_gt_hu_ssim / len(val_ds)
@@ -704,9 +749,12 @@ def main():
             {
                 "loss": avg_loss,
                 "psnr": avg_psnr,
+                "psnr_std": std_psnr,
                 "ssim": avg_ssim,
+                "ssim_std": std_ssim,
                 "masked_ssim": avg_masked_ssim,
                 "rmse": avg_rmse,
+                "rmse_std": std_rmse,
                 "score_hu_ssim": avg_score_hu_ssim,
                 "li_gt_score_hu_ssim": avg_li_gt_hu_ssim,
                 "epoch": epoch,
@@ -714,8 +762,11 @@ def main():
             step=epoch
         )
         print(
-            f"[Epoch {epoch}] Loss: {avg_loss:.4f} PSNR: {avg_psnr:.2f} SSIM: {avg_ssim:.4f} "
-            f"masked_SSIM: {avg_masked_ssim:.4f} RMSE: {avg_rmse:.4f} "
+            f"[Epoch {epoch}] Loss: {avg_loss:.4f} "
+            f"PSNR: {avg_psnr:.2f} \u00b1 {std_psnr:.2f} "
+            f"SSIM: {avg_ssim:.4f} \u00b1 {std_ssim:.4f} "
+            f"RMSE: {avg_rmse:.4f} \u00b1 {std_rmse:.4f} "
+            f"masked_SSIM: {avg_masked_ssim:.4f} "
             f"score_hu_ssim: {avg_score_hu_ssim:.4f} li_gt_score_hu_ssim: {avg_li_gt_hu_ssim:.4f}"
         )
 

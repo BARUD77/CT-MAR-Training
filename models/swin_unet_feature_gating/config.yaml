@@ -1,0 +1,27 @@
+MODEL:
+  TYPE: swin
+  NAME: swin_tiny_patch4_window7_224
+  DROP_PATH_RATE: 0.1
+  PRETRAIN_CKPT: "./pretrained_ckpt/swin_tiny_patch4_window7_224.pth"
+  DROP_RATE: 0.0
+  SWIN:
+    FINAL_UPSAMPLE: "expand_first"
+    EMBED_DIM: 96
+    DEPTHS: [ 2, 2, 2, 2]
+    DECODER_DEPTHS: [ 1,2, 2, 2]
+    NUM_HEADS: [ 3, 6, 12, 24]
+    WINDOW_SIZE: 8
+    PATCH_SIZE: 4
+    IN_CHANS: 1
+    MLP_RATIO: 8
+    QKV_BIAS: TRUE
+    APE: TRUE
+    PATCH_NORM: TRUE
+    NUM_CLASSES: 1
+    ARTIFACT_GUIDED: TRUE
+    ARTIFACT_MAP_CHANNELS: 1
+    ARTIFACT_SCALE: 1.0
+DATA:
+  IMG_SIZE: 512
+TRAIN:
+  USE_CHECKPOINT: FALSE
