@@ -260,11 +260,13 @@ def main():
                     pred = x
                 elif args.baseline == 'nmar':
                     # Load NMAR images on-the-fly using the dataset's filename ordering.
+                    # NMAR files share the MA filename pattern but with 'metalart' -> 'nmar'.
                     nmar_imgs = []
                     for j in range(x.size(0)):
                         entry = ds.pairs[idx_base + j]
                         ma_file = entry[0]
-                        nmar_path = os.path.join(args.nmar_dir, ma_file)
+                        nmar_file = ma_file.replace('metalart', 'nmar')
+                        nmar_path = os.path.join(args.nmar_dir, nmar_file)
                         arr = np.load(nmar_path).astype(np.float32)
                         if arr.ndim == 3 and arr.shape[0] == 1:
                             arr = arr[0]
