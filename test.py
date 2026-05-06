@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 
 from aapm_dataset import CTMetalArtifactDataset
 from models.swin_unet.vision_transformer import SwinUnet
+from models.swin_unet_feature_gating.vision_transformer import SwinUnet as SwinUnetFG
 from models.unet import UnetGenerator
 from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM
 import numpy as np
@@ -63,7 +64,7 @@ def parse_json_or_none(s):
         raise ValueError(f"--model_kwargs must be valid JSON. Error: {e}\nGot: {s}")
 
 def load_model(args, device, in_ch):
-    if args.model == 'swinunet':
+    if args.model in ('swinunet', 'swinunet_fg'):
         if not args.model_cfg:
             raise ValueError("SwinUnet requires --model_cfg path to YAML file.")
         config = load_config(args.model_cfg)
@@ -79,9 +80,10 @@ def load_model(args, device, in_ch):
             pass
 
         model_kwargs = parse_json_or_none(args.model_kwargs) or {}
-        # Non-guided SwinUnet wrapper reads channels/classes from config.
+        # SwinUnet wrappers read channels/classes from config.
         model_kwargs.pop("num_classes", None)
-        model = SwinUnet(config=config, **model_kwargs).to(device)
+        cls = SwinUnetFG if args.model == 'swinunet_fg' else SwinUnet
+        model = cls(config=config, **model_kwargs).to(device)
     else:
         model_kwargs = parse_json_or_none(args.model_kwargs) or {}
         model = UnetGenerator(in_channels=in_ch, **model_kwargs).to(device)
@@ -89,7 +91,7 @@ def load_model(args, device, in_ch):
 
 def main():
     p = argparse.ArgumentParser(description="Eval script (W&B optional)")
-    p.add_argument('--model', type=str, choices=['unet','swinunet'], required=True)
+    p.add_argument('--model', type=str, choices=['unet','swinunet','swinunet_fg'], required=True)
     p.add_argument('--model_cfg', type=str, help='Path to YAML config (required for swinunet)')
     p.add_argument('--model_kwargs', type=str, default=None,
                    help='Optional JSON dict of kwargs for the chosen model. Example: "{\\"num_classes\\":1}"')
@@ -98,8 +100,9 @@ def main():
     p.add_argument('--gt_dir', type=str, required=True)
     p.add_argument('--mask_dir', type=str, default=None, help='Optional metal-only mask dir (enables masked SSIM + score HU SSIM)')
     p.add_argument('--split', type=str, choices=['train','val','test'], default='train')
-    p.add_argument('--input_mode', type=str, choices=['ma','ma_li'], default='ma',
-                   help="'ma' uses MA only. 'ma_li' uses LI guidance (and concatenates for UNet).")
+    p.add_argument('--input_mode', type=str, choices=['ma','ma_li','ma_amg'], default='ma',
+                   help="'ma' uses MA only. 'ma_li' concatenates [MA,LI] (2ch). "
+                        "'ma_amg' feeds MA (1ch) + artifact_map=A_MG kwarg (for swinunet_fg).")
     p.add_argument('--num_classes', type=int, default=1, help='Output channels/classes')
     p.add_argument('--region_policy', type=str, default='all', choices=['all','body','head'])
     p.add_argument('--batch_size', type=int, default=4)
@@ -116,6 +119,10 @@ def main():
 
     if args.input_mode == 'ma_li' and not args.li_dir:
         raise ValueError("input_mode='ma_li' requires --li_dir")
+    if args.input_mode == 'ma_amg' and not args.li_dir:
+        raise ValueError("input_mode='ma_amg' requires --li_dir (used to compute A_MG = relu(LI - MA))")
+    if args.model == 'swinunet_fg' and args.input_mode != 'ma_amg':
+        raise ValueError("--model swinunet_fg requires --input_mode ma_amg")
 
     os.makedirs(args.log_dir, exist_ok=True)
     if args.save_preds:
@@ -132,8 +139,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Match training behavior:
-    # - input_mode='ma'    -> MA-only input (1 channel)
-    # - input_mode='ma_li' -> concatenate [MA, LI] (2 channels)
+    # - input_mode='ma'     -> MA-only input (1 channel)
+    # - input_mode='ma_li'  -> concatenate [MA, LI] (2 channels)
+    # - input_mode='ma_amg' -> MA (1 channel) + artifact_map kwarg (FG model)
     in_ch = 2 if args.input_mode == 'ma_li' else 1
 
     model = load_model(args, device, in_ch=in_ch)
@@ -145,10 +153,11 @@ def main():
     model.eval()
 
     # Dataset & loaders
+    needs_li = args.input_mode in ('ma_li', 'ma_amg')
     ds = CTMetalArtifactDataset(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
-        li_dir=args.li_dir if args.input_mode == 'ma_li' else None,
+        li_dir=args.li_dir if needs_li else None,
         mask_dir=args.mask_dir,
         split=args.split,
         val_size=0.0,
@@ -160,7 +169,7 @@ def main():
     ds_hu = CTMetalArtifactDataset(
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
-        li_dir=args.li_dir if args.input_mode == 'ma_li' else None,
+        li_dir=args.li_dir if needs_li else None,
         mask_dir=args.mask_dir,
         split=args.split,
         val_size=0.0,
@@ -208,10 +217,17 @@ def main():
                     raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li is None.")
                 li = li.to(device, non_blocking=True)
                 x_in = torch.cat([x, li], dim=1)
+                pred = model(x_in)
+            elif args.input_mode == 'ma_amg':
+                if li is None:
+                    raise RuntimeError("input_mode='ma_amg' requires LI in the batch, but li is None.")
+                li = li.to(device, non_blocking=True)
+                am = torch.relu(li - x)
+                am = am / (am.amax(dim=(2, 3), keepdim=True) + 1e-6)
+                pred = model(x, artifact_map=am)
             else:
                 x_in = x
-
-            pred = model(x_in)
+                pred = model(x_in)
 
             pred_eval = torch.clamp(pred, 0, 1)
             gt_eval   = torch.clamp(y,   0, 1)
