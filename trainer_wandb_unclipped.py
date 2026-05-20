@@ -290,6 +290,7 @@ from models.swin_unet.vision_transformer import SwinUnet
 from models.swin_unet_feature_gating.vision_transformer import SwinUnet as SwinUnetFG
 from models.swin_unet_three_channel.vision_transformer import SwinUnet as SwinUnet3Ch
 from models.unet import UnetGenerator
+from models.redcnn import REDCNN
 
 import numpy as np
 from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM, compute_masked_SSIM_per_image
@@ -335,6 +336,19 @@ def build_model(name: str,
     if name in ("unet", "vanilla_unet", "u-net"):
         m = UnetGenerator(
             in_channels=in_ch,
+            **model_kwargs
+        )
+        return m.to(device)
+    elif name in ("redcnn", "red_cnn", "red-cnn"):
+        num_features = int(model_kwargs.pop("num_features", 96))
+        ksize = int(model_kwargs.pop("ksize", 5))
+        use_input_residual = bool(model_kwargs.pop("use_input_residual", True))
+        m = REDCNN(
+            in_channels=in_ch,
+            out_channels=num_classes,
+            num_features=num_features,
+            ksize=ksize,
+            use_input_residual=use_input_residual,
             **model_kwargs
         )
         return m.to(device)
@@ -391,7 +405,7 @@ def build_model(name: str,
         m = SwinUnet3Ch(config=cfg_ns, **model_kwargs)
         return m.to(device)
     else:
-        raise ValueError(f"Unknown model: {name}. Supported: unet, swinunet, swinunet_fg, swinunet_3ch")
+        raise ValueError(f"Unknown model: {name}. Supported: unet, redcnn, swinunet, swinunet_fg, swinunet_3ch")
 
 def param_groups(model, wd, nowd_names=('bias', 'bn', 'norm')):
     decay, no_decay = [], []
@@ -412,7 +426,7 @@ def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
     # Model selection / config
     parser.add_argument('--model', type=str,
-                        choices=['unet', 'swinunet', 'swinunet_fg', 'swinunet_3ch'],
+                        choices=['unet', 'redcnn', 'swinunet', 'swinunet_fg', 'swinunet_3ch'],
                         required=True,
                         help="Pick an architecture from the registry.")
     parser.add_argument('--model_cfg', type=str, default=None,
@@ -433,6 +447,17 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4,
                         help='DataLoader workers. In Colab, set --num_workers 0 if you hit multiprocessing issues.')
     parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--early_stop_patience', type=int, default=0,
+                        help='Stop training if val SSIM has not improved for this many consecutive epochs. '
+                             '0 (default) disables early stopping.')
+    parser.add_argument('--early_stop_min_delta', type=float, default=0.0,
+                        help='Minimum SSIM improvement to count as progress (default 0.0).')
+    parser.add_argument('--monitor_metric', type=str, default='ssim',
+                        choices=['ssim', 'masked_ssim', 'body_masked_ssim'],
+                        help='Validation metric used to select best.pt and drive early stopping. '
+                             'body_masked_ssim is AAPM-style (metal pixels filled, average over body mask).')
+    parser.add_argument('--body_hu_thresh', type=float, default=-500.0,
+                        help='HU threshold used to derive the body mask from GT (pixel > thresh = body).')
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
     parser.add_argument('--run_name', type=str, default=None, help='W&B run name')
@@ -542,6 +567,7 @@ def main():
 
     best_ssim = -1.0
     best_ckpt_path = None
+    epochs_since_improve = 0  # for early stopping
 
     # Training loop
     for epoch in range(1, args.epochs + 1):
@@ -624,6 +650,9 @@ def main():
         psnr_list = []
         rmse_list = []
         total_masked_ssim = 0.0
+        total_body_masked_ssim = 0.0
+        total_body_masked_ssim_hu = 0.0
+        n_body_masked = 0
         total_score_hu_ssim = 0.0
         total_li_gt_hu_ssim = 0.0
         # compute normalized metal fill for normalized images
@@ -745,6 +774,26 @@ def main():
                     )
                     total_masked_ssim += masked_val
 
+                    # AAPM-style body+metal SSIM: metal filled to 100 HU AND average only over
+                    # body pixels (body mask derived from HU GT). Requires both mask + HU GT.
+                    if metalmask_arg is not None and y_hu is not None:
+                        img_gt_hu_i = y_hu[i, 0]
+                        body_mask = (img_gt_hu_i > float(args.body_hu_thresh)).float()
+                        # Restrict averaging to body intersect non-metal pixels.
+                        body_avg_mask = body_mask * non_metal_mask
+                        _, body_masked_val = compute_masked_SSIM(
+                            img_pred,
+                            img_gt,
+                            data_range=1.0,
+                            mask=body_avg_mask,
+                            metalmask=metalmask_arg,
+                            metal_fill=metal_fill_norm,
+                            hu_min=args.hu_min,
+                            hu_max=args.hu_max,
+                        )
+                        total_body_masked_ssim += body_masked_val
+                        n_body_masked += 1
+
                     # HU-domain masked SSIM computed on GPU tensors (no skimage, no np.load)
                     if metalmask_arg is not None:
                         # Use the model output (normalized space) mapped back to HU, but compare against
@@ -760,6 +809,19 @@ def main():
                             metal_fill=metal_fill_hu,
                         )
                         total_score_hu_ssim += hu_val
+
+                        # AAPM-style body+metal SSIM in HU domain.
+                        body_mask_hu = (img_gt_hu > float(args.body_hu_thresh)).float()
+                        body_avg_mask_hu = body_mask_hu * non_metal_mask
+                        _, body_hu_val = compute_masked_SSIM(
+                            img_pred_hu,
+                            img_gt_hu,
+                            data_range=data_range_hu,
+                            mask=body_avg_mask_hu,
+                            metalmask=metalmask_arg,
+                            metal_fill=metal_fill_hu,
+                        )
+                        total_body_masked_ssim_hu += body_hu_val
 
                         if li_hu is not None:
                             li_img_hu = li_hu[i, 0]
@@ -782,6 +844,8 @@ def main():
         avg_masked_ssim = total_masked_ssim / len(val_ds)
         avg_score_hu_ssim = total_score_hu_ssim / len(val_ds)
         avg_li_gt_hu_ssim = total_li_gt_hu_ssim / len(val_ds)
+        avg_body_masked_ssim = (total_body_masked_ssim / n_body_masked) if n_body_masked > 0 else 0.0
+        avg_body_masked_ssim_hu = (total_body_masked_ssim_hu / n_body_masked) if n_body_masked > 0 else 0.0
 
         # ---------------- Log to W&B ----------------
         wandb.log(
@@ -792,6 +856,8 @@ def main():
                 "ssim": avg_ssim,
                 "ssim_std": std_ssim,
                 "masked_ssim": avg_masked_ssim,
+                "body_masked_ssim": avg_body_masked_ssim,
+                "body_masked_ssim_hu": avg_body_masked_ssim_hu,
                 "rmse": avg_rmse,
                 "rmse_std": std_rmse,
                 "score_hu_ssim": avg_score_hu_ssim,
@@ -806,6 +872,7 @@ def main():
             f"SSIM: {avg_ssim:.4f} \u00b1 {std_ssim:.4f} "
             f"RMSE: {avg_rmse:.4f} \u00b1 {std_rmse:.4f} "
             f"masked_SSIM: {avg_masked_ssim:.4f} "
+            f"body_masked_SSIM: {avg_body_masked_ssim:.4f} "
             f"score_hu_ssim: {avg_score_hu_ssim:.4f} li_gt_score_hu_ssim: {avg_li_gt_hu_ssim:.4f}"
         )
 
@@ -819,13 +886,39 @@ def main():
         last_art.add_file(last_ckpt_path)
         wandb.log_artifact(last_art, aliases=["latest"])
 
-        if avg_ssim > best_ssim:
-            best_ssim = avg_ssim
+        # Pick which metric drives best.pt / early stopping.
+        _metric_lookup = {
+            "ssim": avg_ssim,
+            "masked_ssim": avg_masked_ssim,
+            "body_masked_ssim": avg_body_masked_ssim,
+        }
+        monitored_value = _metric_lookup[args.monitor_metric]
+        if args.monitor_metric == "body_masked_ssim" and n_body_masked == 0:
+            # Fall back if no masks were available this run.
+            monitored_value = avg_ssim
+
+        if monitored_value > best_ssim + args.early_stop_min_delta:
+            best_ssim = monitored_value
             best_ckpt_path = os.path.join(args.log_dir, "best.pt")
-            torch.save({"epoch": epoch, "model_state": model.state_dict()}, best_ckpt_path)
+            torch.save({"epoch": epoch, "model_state": model.state_dict(),
+                        "monitor_metric": args.monitor_metric,
+                        "monitor_value": monitored_value}, best_ckpt_path)
             best_art = wandb.Artifact(f"{args.model}-best", type="model")
             best_art.add_file(best_ckpt_path)
             wandb.log_artifact(best_art, aliases=["best"])
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
+
+        # ---------------- Early stopping ----------------
+        wandb.log({"early_stop/epochs_since_improve": epochs_since_improve,
+                   "early_stop/best_ssim": best_ssim}, step=epoch)
+        if args.early_stop_patience > 0 and epochs_since_improve >= args.early_stop_patience:
+            print(f"⏹️  Early stopping at epoch {epoch}: "
+                  f"no SSIM improvement for {epochs_since_improve} epochs "
+                  f"(best={best_ssim:.4f}, patience={args.early_stop_patience}).")
+            wandb.run.summary["early_stopped_epoch"] = epoch
+            break
 
     wandb.finish()
     print("✅ Training complete!")
