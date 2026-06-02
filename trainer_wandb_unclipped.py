@@ -289,8 +289,10 @@ from aapm_dataset import CTMetalArtifactDataset   # patched dataset that returns
 from models.swin_unet.vision_transformer import SwinUnet
 from models.swin_unet_feature_gating.vision_transformer import SwinUnet as SwinUnetFG
 from models.swin_unet_three_channel.vision_transformer import SwinUnet as SwinUnet3Ch
+from models.swin_unet_v2.swin_unet_v2 import SwinTransformerSys as SwinUnetV2
 from models.unet import UnetGenerator
 from models.redcnn import REDCNN
+from models.gan import Generator as GANGenerator, Discriminator as GANDiscriminator
 
 import numpy as np
 from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM, compute_masked_SSIM_per_image
@@ -352,6 +354,17 @@ def build_model(name: str,
             **model_kwargs
         )
         return m.to(device)
+    elif name in ("gan", "unet_gan", "patch_gan"):
+        # GAN trainer uses Generator as the "model"; Discriminator is built
+        # separately in main() when --model gan.
+        bottleneck = str(model_kwargs.pop("bottleneck", "conv"))
+        m = GANGenerator(
+            in_channels=in_ch,
+            out_channels=num_classes,
+            bottleneck=bottleneck,
+            **model_kwargs
+        )
+        return m.to(device)
     elif name in ("swinunet", "swin_unet", "swin-u"):
         if not model_cfg_path:
             raise ValueError("SwinUnet requires --model_cfg <path to YAML>.")
@@ -404,8 +417,36 @@ def build_model(name: str,
         model_kwargs.pop("num_classes", None)
         m = SwinUnet3Ch(config=cfg_ns, **model_kwargs)
         return m.to(device)
+    elif name in ("swinunet_v2", "swin_unet_v2", "swinunet-v2"):
+        if not model_cfg_path:
+            raise ValueError("SwinUnet V2 requires --model_cfg <path to YAML>.")
+        cfg_ns = load_config_namespace(model_cfg_path)
+        try:
+            cfg_ns.MODEL.SWIN.IN_CHANS = in_ch
+        except Exception:
+            pass
+        try:
+            cfg_ns.MODEL.SWIN.NUM_CLASSES = int(num_classes)
+        except Exception:
+            pass
+        model_kwargs.pop("num_classes", None)
+        m = SwinUnetV2(
+            img_size=int(cfg_ns.DATA.IMG_SIZE),
+            patch_size=int(cfg_ns.MODEL.SWIN.PATCH_SIZE),
+            in_chans=int(cfg_ns.MODEL.SWIN.IN_CHANS),
+            num_classes=int(cfg_ns.MODEL.SWIN.NUM_CLASSES),
+            embed_dim=int(cfg_ns.MODEL.SWIN.EMBED_DIM),
+            depths=list(cfg_ns.MODEL.SWIN.DEPTHS),
+            depths_decoder=list(cfg_ns.MODEL.SWIN.DECODER_DEPTHS),
+            num_heads=list(cfg_ns.MODEL.SWIN.NUM_HEADS),
+            window_size=int(cfg_ns.MODEL.SWIN.WINDOW_SIZE),
+            drop_path_rate=float(cfg_ns.MODEL.DROP_PATH_RATE),
+            final_upsample=str(cfg_ns.MODEL.SWIN.FINAL_UPSAMPLE),
+            **model_kwargs
+        )
+        return m.to(device)
     else:
-        raise ValueError(f"Unknown model: {name}. Supported: unet, redcnn, swinunet, swinunet_fg, swinunet_3ch")
+        raise ValueError(f"Unknown model: {name}. Supported: unet, redcnn, gan, swinunet, swinunet_fg, swinunet_3ch, swinunet_v2")
 
 def param_groups(model, wd, nowd_names=('bias', 'bn', 'norm')):
     decay, no_decay = [], []
@@ -426,7 +467,7 @@ def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
     # Model selection / config
     parser.add_argument('--model', type=str,
-                        choices=['unet', 'redcnn', 'swinunet', 'swinunet_fg', 'swinunet_3ch'],
+                        choices=['unet', 'redcnn', 'gan', 'swinunet', 'swinunet_fg', 'swinunet_3ch'],
                         required=True,
                         help="Pick an architecture from the registry.")
     parser.add_argument('--model_cfg', type=str, default=None,
@@ -471,12 +512,23 @@ def main():
     parser.add_argument('--hu_max', type=float, default=3072.0, help='Maximum HU for clipping before normalization')
     parser.add_argument('--no_clip', action='store_true', help='Disable HU clipping in the dataset (values may go outside [0,1] after normalization).')
 
+    # GAN-specific (only used when --model gan)
+    parser.add_argument('--gan_lambda_l1', type=float, default=100.0,
+                        help='Weight of pixel L1 loss in the generator objective.')
+    parser.add_argument('--gan_lambda_adv', type=float, default=1.0,
+                        help='Weight of adversarial BCE loss in the generator objective.')
+    parser.add_argument('--gan_d_lr', type=float, default=2e-4,
+                        help='Learning rate for the GAN discriminator (Adam).')
+    parser.add_argument('--gan_d_beta1', type=float, default=0.5,
+                        help='Adam beta1 for the GAN discriminator.')
+
     args = parser.parse_args()
 
     # LI is required for ma_li mode and for the feature-gating Swin-UNet
     # (which uses LI to build the soft artifact map A_MG).
     is_swin_fg = args.model.lower() in ("swinunet_fg", "swin_unet_fg", "swinunet-fg", "feature_gating")
     is_swin_3ch = args.model.lower() in ("swinunet_3ch", "swin_unet_3ch", "swinunet-3ch", "three_channel")
+    is_gan = args.model.lower() in ("gan", "unet_gan", "patch_gan")
     if args.input_mode == 'ma_li' and not args.li_dir:
         raise ValueError("input_mode='ma_li' requires --li_dir (LI files).")
     if is_swin_fg and not args.li_dir:
@@ -523,6 +575,23 @@ def main():
 
     # track gradients/weights (optional)
     wandb.watch(model, log='gradients', log_freq=100)
+
+    # ---------------- (GAN only) Build discriminator + its optimizer ----------------
+    discriminator = None
+    optimizer_D = None
+    bce_loss = None
+    if is_gan:
+        discriminator = GANDiscriminator(in_channels=args.num_classes).to(device)
+        optimizer_D = torch.optim.Adam(
+            discriminator.parameters(),
+            lr=args.gan_d_lr,
+            betas=(args.gan_d_beta1, 0.999),
+        )
+        bce_loss = torch.nn.BCELoss()
+        wandb.watch(discriminator, log='gradients', log_freq=100)
+        print(f"[GAN] Built discriminator on {args.num_classes}-ch images. "
+              f"lambda_l1={args.gan_lambda_l1}, lambda_adv={args.gan_lambda_adv}, "
+              f"d_lr={args.gan_d_lr}, d_beta1={args.gan_d_beta1}")
 
     # ---------------- Dataset / loaders ----------------
 
@@ -573,6 +642,11 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_loss = 0.0
+        train_loss_d = 0.0
+        train_loss_g_adv = 0.0
+        train_loss_g_l1 = 0.0
+        if discriminator is not None:
+            discriminator.train()
 
         for batch in train_loader:
             # unpack batch robustly: support (x,y), (x,y,li), (x,y,mask), (x,y,mask,li)
@@ -636,13 +710,39 @@ def main():
                     x_in = x_batch
                 pred = model(x_in)
 
-            loss = loss_fn(pred, y_batch)
+            if is_gan:
+                # ---- Discriminator step ----
+                optimizer_D.zero_grad(set_to_none=True)
+                real_score = discriminator(y_batch)
+                fake_score_d = discriminator(pred.detach())
+                loss_d_real = bce_loss(real_score, torch.ones_like(real_score))
+                loss_d_fake = bce_loss(fake_score_d, torch.zeros_like(fake_score_d))
+                loss_d = 0.5 * (loss_d_real + loss_d_fake)
+                loss_d.backward()
+                optimizer_D.step()
+
+                # ---- Generator step ----
+                fake_score_g = discriminator(pred)
+                loss_g_adv = bce_loss(fake_score_g, torch.ones_like(fake_score_g))
+                loss_g_l1 = loss_fn(pred, y_batch)
+                loss = args.gan_lambda_l1 * loss_g_l1 + args.gan_lambda_adv * loss_g_adv
+
+                train_loss_d += float(loss_d.item())
+                train_loss_g_adv += float(loss_g_adv.item())
+                train_loss_g_l1 += float(loss_g_l1.item())
+            else:
+                loss = loss_fn(pred, y_batch)
+
             loss.backward()
             optimizer.step()
 
             train_loss += loss.item()
 
         avg_loss = train_loss / max(1, len(train_loader))
+        n_batches = max(1, len(train_loader))
+        avg_loss_d = train_loss_d / n_batches
+        avg_loss_g_adv = train_loss_g_adv / n_batches
+        avg_loss_g_l1 = train_loss_g_l1 / n_batches
 
         # ---------------- Validation ----------------
         model.eval()
@@ -848,8 +948,7 @@ def main():
         avg_body_masked_ssim_hu = (total_body_masked_ssim_hu / n_body_masked) if n_body_masked > 0 else 0.0
 
         # ---------------- Log to W&B ----------------
-        wandb.log(
-            {
+        log_payload = {
                 "loss": avg_loss,
                 "psnr": avg_psnr,
                 "psnr_std": std_psnr,
@@ -863,9 +962,12 @@ def main():
                 "score_hu_ssim": avg_score_hu_ssim,
                 "li_gt_score_hu_ssim": avg_li_gt_hu_ssim,
                 "epoch": epoch,
-            },
-            step=epoch
-        )
+        }
+        if is_gan:
+            log_payload["gan/loss_d"] = avg_loss_d
+            log_payload["gan/loss_g_adv"] = avg_loss_g_adv
+            log_payload["gan/loss_g_l1"] = avg_loss_g_l1
+        wandb.log(log_payload, step=epoch)
         print(
             f"[Epoch {epoch}] Loss: {avg_loss:.4f} "
             f"PSNR: {avg_psnr:.2f} \u00b1 {std_psnr:.2f} "
