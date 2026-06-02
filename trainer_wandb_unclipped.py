@@ -190,7 +190,7 @@ def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
     # Model selection / config
     parser.add_argument('--model', type=str,
-                        choices=['unet', 'redcnn', 'gan', 'swinunet', 'swinunet_fg', 'swinunet_3ch'],
+                        choices=['unet', 'redcnn', 'gan', 'swinunet', 'swinunet_fg', 'swinunet_3ch', 'swinunet_v2'],
                         required=True,
                         help="Pick an architecture from the registry.")
     parser.add_argument('--model_cfg', type=str, default=None,
