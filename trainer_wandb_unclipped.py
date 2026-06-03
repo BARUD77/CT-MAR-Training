@@ -706,10 +706,8 @@ def main():
         last_ckpt_path = os.path.join(args.log_dir, "last.pt")
         torch.save({"epoch": epoch, "model_state": model.state_dict()}, last_ckpt_path)
 
-        # Upload/update "last" artifact each epoch (creates versions in W&B)
-        last_art = wandb.Artifact(f"{args.model}-last", type="model")
-        last_art.add_file(last_ckpt_path)
-        wandb.log_artifact(last_art, aliases=["latest"])
+        # Checkpoint saved locally (or to Google Drive if log_dir points there)
+        # Skipped W&B upload via wandb.log_artifact()
 
         # Pick which metric drives best.pt / early stopping.
         _metric_lookup = {
@@ -728,9 +726,8 @@ def main():
             torch.save({"epoch": epoch, "model_state": model.state_dict(),
                         "monitor_metric": args.monitor_metric,
                         "monitor_value": monitored_value}, best_ckpt_path)
-            best_art = wandb.Artifact(f"{args.model}-best", type="model")
-            best_art.add_file(best_ckpt_path)
-            wandb.log_artifact(best_art, aliases=["best"])
+            # Checkpoint saved locally (or to Google Drive if log_dir points there)
+            # Skipped W&B upload via wandb.log_artifact()
             epochs_since_improve = 0
         else:
             epochs_since_improve += 1
