@@ -186,6 +186,20 @@ def param_groups(model, wd, nowd_names=('bias', 'bn', 'norm')):
         {'params': no_decay, 'weight_decay': 0.0},
     ]
 
+
+def apply_metal_on_gt(y_batch, x_batch, mask_batch):
+    """Paint the metal region (mask==1) from the MA input onto the GT target.
+
+    Keeps the metal present in both input and target so the model only has to
+    remove streak artifacts rather than inpaint the metal itself.
+    """
+    if mask_batch is None:
+        raise RuntimeError(
+            "--metal_mask_on_gt is enabled but no metal mask is in the batch. "
+            "Pass --mask_dir so the dataset provides masks."
+        )
+    return torch.where(mask_batch > 0.5, x_batch, y_batch)
+
 # ----------------------------- Main -----------------------------
 def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
@@ -223,6 +237,10 @@ def main():
                              'body_masked_ssim is AAPM-style (metal pixels filled, average over body mask).')
     parser.add_argument('--body_hu_thresh', type=float, default=-500.0,
                         help='HU threshold used to derive the body mask from GT (pixel > thresh = body).')
+    parser.add_argument('--metal_mask_on_gt', action='store_true',
+                        help='Paint the metal region (from the metal mask) of the MA input onto the GT target, '
+                             'so the metal stays present in both input and target. Makes the MA->GT translation '
+                             'easier (model only removes streak artifacts). Requires --mask_dir.')
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--warmup_epochs', type=float, default=5.0,
                         help='Linear LR warmup duration (in epochs) before cosine decay. '
@@ -428,6 +446,10 @@ def main():
             if mask_batch is not None:
                 mask_batch = mask_batch.to(device, non_blocking=True)
 
+            # Optionally paint the metal region of MA onto the GT target.
+            if args.metal_mask_on_gt:
+                y_batch = apply_metal_on_gt(y_batch, x_batch, mask_batch)
+
             optimizer.zero_grad(set_to_none=True)
 
             # Build input tensor based on model + input_mode
@@ -561,6 +583,13 @@ def main():
                 y_hu = y_hu.to(device, non_blocking=True)
                 if li_hu is not None:
                     li_hu = li_hu.to(device, non_blocking=True)
+
+                # Optionally paint the metal region onto the GT target (match training).
+                if args.metal_mask_on_gt:
+                    y_batch = apply_metal_on_gt(y_batch, x_batch, mask_batch)
+                    if y_hu is not None and x_hu is not None and mask_hu is not None:
+                        x_hu = x_hu.to(device, non_blocking=True)
+                        y_hu = apply_metal_on_gt(y_hu, x_hu, mask_hu.to(device, non_blocking=True))
 
                 if args.input_mode == 'ma_li':
                     if li_batch is None:
