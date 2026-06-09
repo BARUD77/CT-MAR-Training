@@ -333,7 +333,19 @@ class CTMetalArtifactDataset(Dataset):
             self.pairs = triplets_all
         else:
             if val_size > 0:
-                train, val = train_test_split(triplets_all, test_size=val_size, random_state=seed, shuffle=True)
+                # Region label per triplet (keys and triplets_all share the same order).
+                region_labels = [k[0] for k in keys]
+                # Stratify by region so the validation set preserves the dataset's
+                # body/head ratio (e.g. ~87% body / ~13% head). The fixed random_state
+                # guarantees the same slices are selected on every run.
+                stratify = region_labels if len(set(region_labels)) > 1 else None
+                train, val = train_test_split(
+                    triplets_all,
+                    test_size=val_size,
+                    random_state=seed,
+                    shuffle=True,
+                    stratify=stratify,
+                )
             else:
                 train, val = triplets_all, []
             self.pairs = {"train": train, "val": val}[split]
@@ -341,8 +353,20 @@ class CTMetalArtifactDataset(Dataset):
         self._keys = keys
         self.region_policy = region_policy
 
+        def _region_counts(triplets):
+            # MA filename is the first element; region is parsed from the name.
+            n_head = sum(1 for t in triplets if "_head_" in t[0].lower())
+            n_body = len(triplets) - n_head
+            return n_body, n_head
+
+        tr_body, tr_head = _region_counts(train)
+        va_body, va_head = _region_counts(val)
+        va_total = max(1, len(val))
         print(f"[CTDataset] total={len(triplets_all)} | train={len(train)} | val={len(val)} "
               f"| region={region_policy} | window=[{self.hu_min},{self.hu_max}] | shape={self.image_shape}")
+        print(f"[CTDataset] train body/head={tr_body}/{tr_head} | "
+              f"val body/head={va_body}/{va_head} "
+              f"({100.0 * va_body / va_total:.1f}% body / {100.0 * va_head / va_total:.1f}% head)")
 
     # ----------------- helpers -----------------
     def _load_npy(self, path: str) -> np.ndarray:
