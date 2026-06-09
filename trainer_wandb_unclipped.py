@@ -19,7 +19,7 @@ from models.unet import UnetGenerator
 # from models.gan import Generator as GANGenerator, Discriminator as GANDiscriminator
 
 import numpy as np
-from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM, compute_masked_SSIM_per_image, compute_masked_RMSE_HU
+from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM, compute_masked_SSIM_per_image, compute_masked_RMSE_HU, compute_masked_SSIM_loss
 import wandb
 
 
@@ -200,6 +200,34 @@ def apply_metal_on_gt(y_batch, x_batch, mask_batch):
         )
     return torch.where(mask_batch > 0.5, x_batch, y_batch)
 
+
+def recon_loss(pred, target, mask_batch, l1_fn, ssim_weight=0.0, ssim_dilation=2):
+    """Reconstruction loss = masked L1 + ssim_weight * (1 - masked SSIM).
+
+    Both terms exclude the metal region when a mask is provided:
+      - L1 is masked at the pixel level (metal pixels dropped from the mean).
+      - SSIM is masked at the SSIM-map level over a dilated metal region
+        (differentiable, no zero-filling of the input).
+    Falls back to unmasked L1 / SSIM when mask_batch is None.
+    """
+    if mask_batch is not None:
+        valid = (mask_batch <= 0.5).float()
+        denom = valid.sum().clamp_min(1.0)
+        l1 = ((pred - target).abs() * valid).sum() / denom
+    else:
+        l1 = l1_fn(pred, target)
+
+    total = l1
+    if ssim_weight and ssim_weight > 0:
+        ssim_val = compute_masked_SSIM_loss(
+            pred, target,
+            metal_mask=mask_batch,
+            data_range=1.0,
+            dilation=ssim_dilation,
+        )
+        total = total + float(ssim_weight) * (1.0 - ssim_val)
+    return total
+
 # ----------------------------- Main -----------------------------
 def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
@@ -247,6 +275,11 @@ def main():
                              'Set 0 to disable warmup. Cosine decay anneals LR toward ~0 over the remaining epochs.')
     parser.add_argument('--min_lr_ratio', type=float, default=0.0,
                         help='Final LR as a fraction of --learning_rate at the end of cosine decay (e.g. 0.01).')
+    parser.add_argument('--ssim_loss_weight', type=float, default=0.1,
+                        help='Weight w for the SSIM loss term: total = masked_L1 + w*(1 - masked_SSIM). 0 disables.')
+    parser.add_argument('--ssim_loss_dilation', type=int, default=2,
+                        help='Pixels to dilate the metal mask before excluding it from the SSIM-map average '
+                             '(drops windows that straddle the metal boundary).')
     parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
     parser.add_argument('--run_name', type=str, default=None, help='W&B run name')
     parser.add_argument('--project', type=str, default='ct-mar', help='W&B project name')
@@ -500,7 +533,9 @@ def main():
                 train_loss_g_adv += float(loss_g_adv.item())
                 train_loss_g_l1 += float(loss_g_l1.item())
             else:
-                loss = loss_fn(pred, y_batch)
+                loss = recon_loss(pred, y_batch, mask_batch, loss_fn,
+                                  ssim_weight=args.ssim_loss_weight,
+                                  ssim_dilation=args.ssim_loss_dilation)
 
             loss.backward()
             optimizer.step()
