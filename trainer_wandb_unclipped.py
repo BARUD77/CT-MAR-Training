@@ -2,6 +2,7 @@
 import argparse
 import os
 import json
+import math
 import torch
 import yaml
 from types import SimpleNamespace
@@ -223,6 +224,11 @@ def main():
     parser.add_argument('--body_hu_thresh', type=float, default=-500.0,
                         help='HU threshold used to derive the body mask from GT (pixel > thresh = body).')
     parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--warmup_epochs', type=float, default=5.0,
+                        help='Linear LR warmup duration (in epochs) before cosine decay. '
+                             'Set 0 to disable warmup. Cosine decay anneals LR toward ~0 over the remaining epochs.')
+    parser.add_argument('--min_lr_ratio', type=float, default=0.0,
+                        help='Final LR as a fraction of --learning_rate at the end of cosine decay (e.g. 0.01).')
     parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
     parser.add_argument('--run_name', type=str, default=None, help='W&B run name')
     parser.add_argument('--project', type=str, default='ct-mar', help='W&B project name')
@@ -357,6 +363,24 @@ def main():
                               lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8)
     loss_fn = torch.nn.L1Loss()
 
+    # ---------------- LR schedule: linear warmup + cosine decay (per-iteration) ----------------
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = max(1, args.epochs * steps_per_epoch)
+    warmup_steps = max(0, int(round(args.warmup_epochs * steps_per_epoch)))
+    min_lr_ratio = max(0.0, float(args.min_lr_ratio))
+
+    def lr_lambda(current_step):
+        # Linear warmup from 0 -> 1
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step + 1) / float(warmup_steps)
+        # Cosine decay from 1 -> min_lr_ratio
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     best_ssim = -1.0
     best_ckpt_path = None
     epochs_since_improve = 0  # for early stopping
@@ -458,6 +482,7 @@ def main():
 
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             train_loss += loss.item()
 
@@ -684,6 +709,7 @@ def main():
                 "rmse_std": std_rmse,
                 "score_hu_ssim": avg_score_hu_ssim,
                 "li_gt_score_hu_ssim": avg_li_gt_hu_ssim,
+                "lr": optimizer.param_groups[0]["lr"],
                 "epoch": epoch,
         }
         if is_gan:
