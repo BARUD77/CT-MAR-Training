@@ -280,6 +280,12 @@ def main():
     parser.add_argument('--ssim_loss_dilation', type=int, default=2,
                         help='Pixels to dilate the metal mask before excluding it from the SSIM-map average '
                              '(drops windows that straddle the metal boundary).')
+    parser.add_argument('--amp', action='store_true',
+                        help='Enable automatic mixed precision (autocast). Big speedup on A100/Ampere+ GPUs. '
+                             'No-op on CPU.')
+    parser.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
+                        help='Autocast compute dtype when --amp is set. bf16 (recommended on A100) skips the '
+                             'GradScaler; fp16 uses a GradScaler to avoid underflow.')
     parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
     parser.add_argument('--run_name', type=str, default=None, help='W&B run name')
     parser.add_argument('--project', type=str, default='ct-mar', help='W&B project name')
@@ -331,7 +337,11 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Decide input channels to pass to model builder
+    # Allow TF32 on Ampere+ (A100) for faster fp32 matmul/conv with negligible accuracy loss.
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     # - swinunet_fg          -> single-stream MA input (1ch); LI is used as artifact_map
     # - swinunet_3ch         -> 3-channel input [MA, LI, A_MG]
     # - input_mode='ma_li'   -> 2-channel input [MA, LI] (vanilla UNet / plain SwinUnet)
@@ -432,6 +442,15 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # ---------------- Mixed precision (AMP) ----------------
+    amp_enabled = bool(args.amp) and device.type == 'cuda'
+    amp_dtype = torch.bfloat16 if args.amp_dtype == 'bf16' else torch.float16
+    # GradScaler is only needed for fp16; bf16 has enough dynamic range to skip it.
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
+    if amp_enabled:
+        print(f"AMP enabled: autocast dtype={args.amp_dtype} "
+              f"(GradScaler={'on' if amp_dtype == torch.float16 else 'off'})")
+
     best_ssim = -1.0
     best_ckpt_path = None
     epochs_since_improve = 0  # for early stopping
@@ -485,60 +504,66 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Build input tensor based on model + input_mode
-            if is_swin_fg:
-                # Single-stream MA input; pass A_MG = normalize(relu(LI - MA)) as artifact_map.
-                if li_batch is None:
-                    raise RuntimeError("swinunet_fg requires LI in the batch, but li_batch is None.")
-                artifact_map = torch.relu(li_batch - x_batch)
-                am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
-                artifact_map = artifact_map / (am_max + 1e-6)
-                pred = model(x_batch, artifact_map=artifact_map)
-            elif is_swin_3ch:
-                # 3-channel input: [MA, LI, A_MG]
-                if li_batch is None:
-                    raise RuntimeError("swinunet_3ch requires LI in the batch, but li_batch is None.")
-                artifact_map = torch.relu(li_batch - x_batch)
-                am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
-                artifact_map = artifact_map / (am_max + 1e-6)
-                x_in = torch.cat([x_batch, li_batch, artifact_map], dim=1)
-                pred = model(x_in)
-            else:
-                if args.input_mode == 'ma_li':
+            # ---- Forward (under autocast for mixed precision) ----
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                # Build input tensor based on model + input_mode
+                if is_swin_fg:
+                    # Single-stream MA input; pass A_MG = normalize(relu(LI - MA)) as artifact_map.
                     if li_batch is None:
-                        raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li_batch is None.")
-                    x_in = torch.cat([x_batch, li_batch], dim=1)
+                        raise RuntimeError("swinunet_fg requires LI in the batch, but li_batch is None.")
+                    artifact_map = torch.relu(li_batch - x_batch)
+                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                    artifact_map = artifact_map / (am_max + 1e-6)
+                    pred = model(x_batch, artifact_map=artifact_map)
+                elif is_swin_3ch:
+                    # 3-channel input: [MA, LI, A_MG]
+                    if li_batch is None:
+                        raise RuntimeError("swinunet_3ch requires LI in the batch, but li_batch is None.")
+                    artifact_map = torch.relu(li_batch - x_batch)
+                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                    artifact_map = artifact_map / (am_max + 1e-6)
+                    x_in = torch.cat([x_batch, li_batch, artifact_map], dim=1)
+                    pred = model(x_in)
                 else:
-                    x_in = x_batch
-                pred = model(x_in)
+                    if args.input_mode == 'ma_li':
+                        if li_batch is None:
+                            raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li_batch is None.")
+                        x_in = torch.cat([x_batch, li_batch], dim=1)
+                    else:
+                        x_in = x_batch
+                    pred = model(x_in)
 
             if is_gan:
                 # ---- Discriminator step ----
                 optimizer_D.zero_grad(set_to_none=True)
-                real_score = discriminator(y_batch)
-                fake_score_d = discriminator(pred.detach())
-                loss_d_real = bce_loss(real_score, torch.ones_like(real_score))
-                loss_d_fake = bce_loss(fake_score_d, torch.zeros_like(fake_score_d))
-                loss_d = 0.5 * (loss_d_real + loss_d_fake)
-                loss_d.backward()
-                optimizer_D.step()
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    real_score = discriminator(y_batch)
+                    fake_score_d = discriminator(pred.detach())
+                    loss_d_real = bce_loss(real_score, torch.ones_like(real_score))
+                    loss_d_fake = bce_loss(fake_score_d, torch.zeros_like(fake_score_d))
+                    loss_d = 0.5 * (loss_d_real + loss_d_fake)
+                scaler.scale(loss_d).backward()
+                scaler.step(optimizer_D)
 
                 # ---- Generator step ----
-                fake_score_g = discriminator(pred)
-                loss_g_adv = bce_loss(fake_score_g, torch.ones_like(fake_score_g))
-                loss_g_l1 = loss_fn(pred, y_batch)
-                loss = args.gan_lambda_l1 * loss_g_l1 + args.gan_lambda_adv * loss_g_adv
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    fake_score_g = discriminator(pred)
+                    loss_g_adv = bce_loss(fake_score_g, torch.ones_like(fake_score_g))
+                    loss_g_l1 = loss_fn(pred, y_batch)
+                    loss = args.gan_lambda_l1 * loss_g_l1 + args.gan_lambda_adv * loss_g_adv
 
                 train_loss_d += float(loss_d.item())
                 train_loss_g_adv += float(loss_g_adv.item())
                 train_loss_g_l1 += float(loss_g_l1.item())
             else:
-                loss = recon_loss(pred, y_batch, mask_batch, loss_fn,
-                                  ssim_weight=args.ssim_loss_weight,
-                                  ssim_dilation=args.ssim_loss_dilation)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    loss = recon_loss(pred, y_batch, mask_batch, loss_fn,
+                                      ssim_weight=args.ssim_loss_weight,
+                                      ssim_dilation=args.ssim_loss_dilation)
 
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             train_loss += loss.item()
@@ -624,23 +649,27 @@ def main():
                     x_in = torch.cat([x_batch, li_batch], dim=1)
                 else:
                     x_in = x_batch
-                if is_swin_fg:
-                    if li_batch is None:
-                        raise RuntimeError("swinunet_fg requires LI in the batch, but li_batch is None.")
-                    artifact_map = torch.relu(li_batch - x_batch)
-                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
-                    artifact_map = artifact_map / (am_max + 1e-6)
-                    pred = model(x_batch, artifact_map=artifact_map)
-                elif is_swin_3ch:
-                    if li_batch is None:
-                        raise RuntimeError("swinunet_3ch requires LI in the batch, but li_batch is None.")
-                    artifact_map = torch.relu(li_batch - x_batch)
-                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
-                    artifact_map = artifact_map / (am_max + 1e-6)
-                    x_in = torch.cat([x_batch, li_batch, artifact_map], dim=1)
-                    pred = model(x_in)
-                else:
-                    pred = model(x_in)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    if is_swin_fg:
+                        if li_batch is None:
+                            raise RuntimeError("swinunet_fg requires LI in the batch, but li_batch is None.")
+                        artifact_map = torch.relu(li_batch - x_batch)
+                        am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                        artifact_map = artifact_map / (am_max + 1e-6)
+                        pred = model(x_batch, artifact_map=artifact_map)
+                    elif is_swin_3ch:
+                        if li_batch is None:
+                            raise RuntimeError("swinunet_3ch requires LI in the batch, but li_batch is None.")
+                        artifact_map = torch.relu(li_batch - x_batch)
+                        am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                        artifact_map = artifact_map / (am_max + 1e-6)
+                        x_in = torch.cat([x_batch, li_batch, artifact_map], dim=1)
+                        pred = model(x_in)
+                    else:
+                        pred = model(x_in)
+
+                # Cast back to fp32 so downstream numpy-based metrics work with bf16/fp16 autocast.
+                pred = pred.float()
 
                 # Normalized metrics are computed on clamped [0,1] tensors.
                 pred_eval = torch.clamp(pred, 0, 1)
