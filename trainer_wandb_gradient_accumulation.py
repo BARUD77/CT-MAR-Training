@@ -6,6 +6,7 @@
 import argparse
 import os
 import json
+import math
 import torch
 import yaml
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from models.unet import UnetGenerator
 # from models.gan import Generator as GANGenerator, Discriminator as GANDiscriminator
 
 import numpy as np
-from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM, compute_masked_SSIM_per_image
+from metrics import compute_SSIM, compute_PSNR, compute_RMSE, compute_masked_SSIM, compute_masked_SSIM_per_image, compute_masked_RMSE_HU, compute_masked_SSIM_loss
 import wandb
 
 
@@ -189,6 +190,48 @@ def param_groups(model, wd, nowd_names=('bias', 'bn', 'norm')):
         {'params': no_decay, 'weight_decay': 0.0},
     ]
 
+
+def apply_metal_on_gt(y_batch, x_batch, mask_batch):
+    """Paint the metal region (mask==1) from the MA input onto the GT target.
+
+    Keeps the metal present in both input and target so the model only has to
+    remove streak artifacts rather than inpaint the metal itself.
+    """
+    if mask_batch is None:
+        raise RuntimeError(
+            "--metal_mask_on_gt is enabled but no metal mask is in the batch. "
+            "Pass --mask_dir so the dataset provides masks."
+        )
+    return torch.where(mask_batch > 0.5, x_batch, y_batch)
+
+
+def recon_loss(pred, target, mask_batch, l1_fn, ssim_weight=0.0, ssim_dilation=2):
+    """Reconstruction loss = masked L1 + ssim_weight * (1 - masked SSIM).
+
+    Both terms exclude the metal region when a mask is provided:
+      - L1 is masked at the pixel level (metal pixels dropped from the mean).
+      - SSIM is masked at the SSIM-map level over a dilated metal region
+        (differentiable, no zero-filling of the input).
+    Falls back to unmasked L1 / SSIM when mask_batch is None.
+    """
+    if mask_batch is not None:
+        valid = (mask_batch <= 0.5).float()
+        denom = valid.sum().clamp_min(1.0)
+        l1 = ((pred - target).abs() * valid).sum() / denom
+    else:
+        l1 = l1_fn(pred, target)
+
+    total = l1
+    if ssim_weight and ssim_weight > 0:
+        ssim_val = compute_masked_SSIM_loss(
+            pred, target,
+            metal_mask=mask_batch,
+            data_range=1.0,
+            dilation=ssim_dilation,
+        )
+        total = total + float(ssim_weight) * (1.0 - ssim_val)
+    return total
+
 # ----------------------------- Main -----------------------------
 def main():
     parser = argparse.ArgumentParser(description="Training script with gradient accumulation (W&B only, model-agnostic)")
@@ -224,12 +267,26 @@ def main():
     parser.add_argument('--early_stop_min_delta', type=float, default=0.0,
                         help='Minimum SSIM improvement to count as progress (default 0.0).')
     parser.add_argument('--monitor_metric', type=str, default='ssim',
-                        choices=['ssim', 'masked_ssim', 'body_masked_ssim'],
+                        choices=['ssim'],
                         help='Validation metric used to select best.pt and drive early stopping. '
-                             'body_masked_ssim is AAPM-style (metal pixels filled, average over body mask).')
+                             'Only the masked SSIM (dilated metal excluded) is reported.')
     parser.add_argument('--body_hu_thresh', type=float, default=-500.0,
                         help='HU threshold used to derive the body mask from GT (pixel > thresh = body).')
+    parser.add_argument('--metal_mask_on_gt', action='store_true',
+                        help='Paint the metal region (from the metal mask) of the MA input onto the GT target, '
+                             'so the metal stays present in both input and target. Makes the MA->GT translation '
+                             'easier (model only removes streak artifacts). Requires --mask_dir.')
     parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--warmup_epochs', type=float, default=5.0,
+                        help='Linear LR warmup duration (in epochs) before cosine decay. '
+                             'Set 0 to disable warmup. Cosine decay anneals LR toward ~0 over the remaining epochs.')
+    parser.add_argument('--min_lr_ratio', type=float, default=0.0,
+                        help='Final LR as a fraction of --learning_rate at the end of cosine decay (e.g. 0.01).')
+    parser.add_argument('--ssim_loss_weight', type=float, default=0.1,
+                        help='Weight w for the SSIM loss term: total = masked_L1 + w*(1 - masked_SSIM). 0 disables.')
+    parser.add_argument('--ssim_loss_dilation', type=int, default=2,
+                        help='Pixels to dilate the metal mask before excluding it from the SSIM-map average '
+                             '(drops windows that straddle the metal boundary).')
     parser.add_argument('--log_dir', type=str, default='./runs', help='Directory to save logs and weights')
     parser.add_argument('--run_name', type=str, default=None, help='W&B run name')
     parser.add_argument('--project', type=str, default='ct-mar', help='W&B project name')
@@ -368,6 +425,24 @@ def main():
                               lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8)
     loss_fn = torch.nn.L1Loss()
 
+    # ---------------- LR schedule: linear warmup + cosine decay (per optimizer update) ----------------
+    updates_per_epoch = max(1, math.ceil(len(train_loader) / args.accumulation_steps))
+    total_steps = max(1, args.epochs * updates_per_epoch)
+    warmup_steps = max(0, int(round(args.warmup_epochs * updates_per_epoch)))
+    min_lr_ratio = max(0.0, float(args.min_lr_ratio))
+
+    def lr_lambda(current_step):
+        # Linear warmup from 0 -> 1
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step + 1) / float(warmup_steps)
+        # Cosine decay from 1 -> min_lr_ratio
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     best_ssim = -1.0
     best_ckpt_path = None
     epochs_since_improve = 0  # for early stopping
@@ -418,6 +493,10 @@ def main():
             if mask_batch is not None:
                 mask_batch = mask_batch.to(device, non_blocking=True)
 
+            # Optionally paint the metal region of MA onto the GT target.
+            if args.metal_mask_on_gt:
+                y_batch = apply_metal_on_gt(y_batch, x_batch, mask_batch)
+
             # Build input tensor based on model + input_mode
             if is_swin_fg:
                 # Single-stream MA input; pass A_MG = normalize(relu(LI - MA)) as artifact_map.
@@ -466,7 +545,9 @@ def main():
                 train_loss_g_adv += float(loss_g_adv.item())
                 train_loss_g_l1 += float(loss_g_l1.item())
             else:
-                loss = loss_fn(pred, y_batch)
+                loss = recon_loss(pred, y_batch, mask_batch, loss_fn,
+                                  ssim_weight=args.ssim_loss_weight,
+                                  ssim_dilation=args.ssim_loss_dilation)
 
             # Scale loss by accumulation steps to get average gradient
             scaled_loss = loss / args.accumulation_steps
@@ -479,11 +560,13 @@ def main():
             if accumulation_counter % args.accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
 
         # Make sure to perform final step if there are remaining accumulated gradients
         if accumulation_counter % args.accumulation_steps != 0:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
 
         avg_loss = train_loss / max(1, len(train_loader))
         n_batches = max(1, len(train_loader))
@@ -496,16 +579,8 @@ def main():
         ssim_list = []
         psnr_list = []
         rmse_list = []
-        total_masked_ssim = 0.0
-        total_body_masked_ssim = 0.0
-        total_body_masked_ssim_hu = 0.0
-        n_body_masked = 0
-        total_score_hu_ssim = 0.0
-        total_li_gt_hu_ssim = 0.0
         # compute normalized metal fill for normalized images
         metal_fill_norm = (100.0 - float(args.hu_min)) / (float(args.hu_max) - float(args.hu_min))
-        metal_fill_hu = 100.0
-        data_range_hu = 5000.0
         with torch.no_grad():
             for batch, batch_hu in zip(val_loader, val_loader_hu):
                 # unpack batch robustly: support (x,y), (x,y,li), (x,y,mask), (x,y,mask,li)
@@ -561,6 +636,13 @@ def main():
                 if li_hu is not None:
                     li_hu = li_hu.to(device, non_blocking=True)
 
+                # Optionally paint the metal region onto the GT target (match training).
+                if args.metal_mask_on_gt:
+                    y_batch = apply_metal_on_gt(y_batch, x_batch, mask_batch)
+                    if y_hu is not None and x_hu is not None and mask_hu is not None:
+                        x_hu = x_hu.to(device, non_blocking=True)
+                        y_hu = apply_metal_on_gt(y_hu, x_hu, mask_hu.to(device, non_blocking=True))
+
                 if args.input_mode == 'ma_li':
                     if li_batch is None:
                         raise RuntimeError("input_mode='ma_li' requires LI in the batch, but li_batch is None.")
@@ -593,11 +675,8 @@ def main():
                 for i in range(pred_eval.size(0)):
                     img_pred = pred_eval[i, 0]
                     img_gt = gt_eval[i, 0]
-                    ssim_list.append(float(compute_SSIM(img_pred, img_gt, data_range=1.0)))
-                    psnr_list.append(float(compute_PSNR(img_pred, img_gt, data_range=1.0)))
-                    rmse_list.append(float(compute_RMSE(img_pred, img_gt)))
 
-                    # compute masked SSIM: treat dataset mask as metal mask (set metals to normalized 100HU)
+                    # Extract per-image metal mask first (needed by all metrics below).
                     metalmask_arg = None
                     non_metal_mask = None
                     if mask_batch is not None:
@@ -609,78 +688,38 @@ def main():
                         metalmask_arg = m
                         non_metal_mask = (m == 0).float()
 
-                    _, masked_val = compute_masked_SSIM(
-                        img_pred,
-                        img_gt,
-                        data_range=1.0,
-                        mask=non_metal_mask,
-                        metalmask=metalmask_arg,
-                        metal_fill=metal_fill_norm,
-                        hu_min=args.hu_min,
-                        hu_max=args.hu_max,
-                    )
-                    total_masked_ssim += masked_val
-
-                    # AAPM-style body+metal SSIM: metal filled to 100 HU AND average only over
-                    # body pixels (body mask derived from HU GT). Requires both mask + HU GT.
-                    if metalmask_arg is not None and y_hu is not None:
-                        img_gt_hu_i = y_hu[i, 0]
-                        body_mask = (img_gt_hu_i > float(args.body_hu_thresh)).float()
-                        # Restrict averaging to body intersect non-metal pixels.
-                        body_avg_mask = body_mask * non_metal_mask
-                        _, body_masked_val = compute_masked_SSIM(
+                    # ---- SSIM: dilate metal by 2 px, fill dilated region to 100 HU,
+                    #      average full SSIM map (data_range=1) over the non-dilated pixels.
+                    if metalmask_arg is not None:
+                        _, ssim_val = compute_masked_SSIM(
                             img_pred,
                             img_gt,
                             data_range=1.0,
-                            mask=body_avg_mask,
+                            mask=None,
                             metalmask=metalmask_arg,
                             metal_fill=metal_fill_norm,
+                            dilate_iters=2,
                             hu_min=args.hu_min,
                             hu_max=args.hu_max,
                         )
-                        total_body_masked_ssim += body_masked_val
-                        n_body_masked += 1
+                    else:
+                        ssim_val = compute_SSIM(img_pred, img_gt, data_range=1.0)
+                    ssim_list.append(float(ssim_val))
 
-                    # HU-domain masked SSIM computed on GPU tensors (no skimage, no np.load)
-                    if metalmask_arg is not None:
-                        # Use the model output (normalized space) mapped back to HU, but compare against
-                        # the HU-domain ground truth from val_ds_hu (optionally unclipped if --no_clip).
-                        img_pred_hu = _to_hu(pred[i, 0], args.hu_min, args.hu_max)
-                        img_gt_hu = y_hu[i, 0]
-                        _, hu_val = compute_masked_SSIM(
-                            img_pred_hu,
-                            img_gt_hu,
-                            data_range=data_range_hu,
-                            mask=non_metal_mask,
-                            metalmask=metalmask_arg,
-                            metal_fill=metal_fill_hu,
-                        )
-                        total_score_hu_ssim += hu_val
-
-                        # AAPM-style body+metal SSIM in HU domain.
-                        body_mask_hu = (img_gt_hu > float(args.body_hu_thresh)).float()
-                        body_avg_mask_hu = body_mask_hu * non_metal_mask
-                        _, body_hu_val = compute_masked_SSIM(
-                            img_pred_hu,
-                            img_gt_hu,
-                            data_range=data_range_hu,
-                            mask=body_avg_mask_hu,
-                            metalmask=metalmask_arg,
-                            metal_fill=metal_fill_hu,
-                        )
-                        total_body_masked_ssim_hu += body_hu_val
-
-                        if li_hu is not None:
-                            li_img_hu = li_hu[i, 0]
-                            _, li_gt_hu_val = compute_masked_SSIM(
-                                li_img_hu,
-                                img_gt_hu,
-                                data_range=data_range_hu,
-                                mask=non_metal_mask,
-                                metalmask=metalmask_arg,
-                                metal_fill=metal_fill_hu,
-                            )
-                            total_li_gt_hu_ssim += li_gt_hu_val
+                    # ---- RMSE (HU) and PSNR: denormalize to HU, dilate metal by 1 px and
+                    #      exclude it; RMSE in HU, PSNR = 20*log10(MAX/RMSE) with MAX=HU range.
+                    rmse_hu = compute_masked_RMSE_HU(
+                        img_pred,
+                        img_gt,
+                        metalmask=metalmask_arg,
+                        hu_min=args.hu_min,
+                        hu_max=args.hu_max,
+                        dilate_iters=1,
+                    )
+                    rmse_list.append(float(rmse_hu))
+                    psnr_max = float(args.hu_max) - float(args.hu_min)  # 4096 HU range
+                    rmse_hu_safe = rmse_hu if rmse_hu > 0 else 1e-10
+                    psnr_list.append(float(20.0 * np.log10(psnr_max / rmse_hu_safe)))
 
         avg_psnr = float(np.mean(psnr_list)) if psnr_list else 0.0
         avg_ssim = float(np.mean(ssim_list)) if ssim_list else 0.0
@@ -688,11 +727,6 @@ def main():
         std_psnr = float(np.std(psnr_list, ddof=1)) if len(psnr_list) > 1 else 0.0
         std_ssim = float(np.std(ssim_list, ddof=1)) if len(ssim_list) > 1 else 0.0
         std_rmse = float(np.std(rmse_list, ddof=1)) if len(rmse_list) > 1 else 0.0
-        avg_masked_ssim = total_masked_ssim / len(val_ds)
-        avg_score_hu_ssim = total_score_hu_ssim / len(val_ds)
-        avg_li_gt_hu_ssim = total_li_gt_hu_ssim / len(val_ds)
-        avg_body_masked_ssim = (total_body_masked_ssim / n_body_masked) if n_body_masked > 0 else 0.0
-        avg_body_masked_ssim_hu = (total_body_masked_ssim_hu / n_body_masked) if n_body_masked > 0 else 0.0
 
         # ---------------- Log to W&B ----------------
         log_payload = {
@@ -701,13 +735,9 @@ def main():
                 "psnr_std": std_psnr,
                 "ssim": avg_ssim,
                 "ssim_std": std_ssim,
-                "masked_ssim": avg_masked_ssim,
-                "body_masked_ssim": avg_body_masked_ssim,
-                "body_masked_ssim_hu": avg_body_masked_ssim_hu,
                 "rmse": avg_rmse,
                 "rmse_std": std_rmse,
-                "score_hu_ssim": avg_score_hu_ssim,
-                "li_gt_score_hu_ssim": avg_li_gt_hu_ssim,
+                "lr": optimizer.param_groups[0]["lr"],
                 "epoch": epoch,
         }
         if is_gan:
@@ -719,10 +749,7 @@ def main():
             f"[Epoch {epoch}] Loss: {avg_loss:.4f} "
             f"PSNR: {avg_psnr:.2f} \u00b1 {std_psnr:.2f} "
             f"SSIM: {avg_ssim:.4f} \u00b1 {std_ssim:.4f} "
-            f"RMSE: {avg_rmse:.4f} \u00b1 {std_rmse:.4f} "
-            f"masked_SSIM: {avg_masked_ssim:.4f} "
-            f"body_masked_SSIM: {avg_body_masked_ssim:.4f} "
-            f"score_hu_ssim: {avg_score_hu_ssim:.4f} li_gt_score_hu_ssim: {avg_li_gt_hu_ssim:.4f}"
+            f"RMSE(HU): {avg_rmse:.2f} \u00b1 {std_rmse:.2f}"
         )
 
         # ---------------- Save checkpoints ----------------
@@ -736,13 +763,8 @@ def main():
         # Pick which metric drives best.pt / early stopping.
         _metric_lookup = {
             "ssim": avg_ssim,
-            "masked_ssim": avg_masked_ssim,
-            "body_masked_ssim": avg_body_masked_ssim,
         }
         monitored_value = _metric_lookup[args.monitor_metric]
-        if args.monitor_metric == "body_masked_ssim" and n_body_masked == 0:
-            # Fall back if no masks were available this run.
-            monitored_value = avg_ssim
 
         if monitored_value > best_ssim + args.early_stop_min_delta:
             best_ssim = monitored_value
