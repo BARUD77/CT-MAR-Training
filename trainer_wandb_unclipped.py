@@ -14,6 +14,7 @@ from models.swin_unet.vision_transformer import SwinUnet
 from models.swin_unet_feature_gating.vision_transformer import SwinUnet as SwinUnetFG
 from models.swin_unet_three_channel.vision_transformer import SwinUnet as SwinUnet3Ch
 from models.swin_unet_v2.swin_unet_v2 import SwinTransformerSys as SwinUnetV2
+from models.swin_unet_v2_SPADE_multiscale_soft_art_map.swin_unet_v2 import SwinTransformerSys as SwinUnetV2Spade
 from models.unet import UnetGenerator
 from models.redcnn import REDCNN
 # from models.gan import Generator as GANGenerator, Discriminator as GANDiscriminator
@@ -169,6 +170,55 @@ def build_model(name: str,
             **model_kwargs
         )
         return m.to(device)
+    elif name in ("swinunet_v2_spade", "swin_unet_v2_spade", "swinunet-v2-spade"):
+        if not model_cfg_path:
+            raise ValueError("SwinUnet V2 SPADE requires --model_cfg <path to YAML>.")
+        cfg_ns = load_config_namespace(model_cfg_path)
+        try:
+            cfg_ns.MODEL.SWIN.IN_CHANS = in_ch  # expected to be 2 for [MA, LI]
+        except Exception:
+            pass
+        try:
+            cfg_ns.MODEL.SWIN.NUM_CLASSES = int(num_classes)
+        except Exception:
+            pass
+        model_kwargs.pop("num_classes", None)
+
+        # Optional SPADE config block (falls back to model defaults if absent).
+        spade_cfg = getattr(cfg_ns.MODEL, "SPADE", None)
+        def _spade(attr, default):
+            if spade_cfg is None:
+                return default
+            return getattr(spade_cfg, attr, default)
+
+        spade_defaults = dict(
+            use_spade=bool(_spade("USE_SPADE", True)),
+            spade_stages=tuple(_spade("STAGES", (0, 1, 2, 3))),
+            spade_norm=str(_spade("NORM", "batch")),
+            spade_hidden=int(_spade("HIDDEN", 128)),
+            spade_ksize=int(_spade("KSIZE", 3)),
+            spade_identity_init=bool(_spade("IDENTITY_INIT", True)),
+            artifact_map_chans=int(_spade("ARTIFACT_MAP_CHANS", 1)),
+        )
+        # Explicit --model_kwargs override the config-derived SPADE defaults.
+        for k, v in spade_defaults.items():
+            model_kwargs.setdefault(k, v)
+
+        m = SwinUnetV2Spade(
+            img_size=int(cfg_ns.DATA.IMG_SIZE),
+            patch_size=int(cfg_ns.MODEL.SWIN.PATCH_SIZE),
+            in_chans=int(cfg_ns.MODEL.SWIN.IN_CHANS),
+            num_classes=int(cfg_ns.MODEL.SWIN.NUM_CLASSES),
+            embed_dim=int(cfg_ns.MODEL.SWIN.EMBED_DIM),
+            depths=list(cfg_ns.MODEL.SWIN.DEPTHS),
+            depths_decoder=list(cfg_ns.MODEL.SWIN.DECODER_DEPTHS),
+            num_heads=list(cfg_ns.MODEL.SWIN.NUM_HEADS),
+            window_size=int(cfg_ns.MODEL.SWIN.WINDOW_SIZE),
+            drop_path_rate=float(cfg_ns.MODEL.DROP_PATH_RATE),
+            final_upsample=str(cfg_ns.MODEL.SWIN.FINAL_UPSAMPLE),
+            **model_kwargs
+        )
+        return m.to(device)
     else:
         raise ValueError(f"Unknown model: {name}. Supported: unet, redcnn, gan, swinunet, swinunet_fg, swinunet_3ch, swinunet_v2")
 
@@ -233,7 +283,7 @@ def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
     # Model selection / config
     parser.add_argument('--model', type=str,
-                        choices=['unet', 'redcnn', 'gan', 'swinunet', 'swinunet_fg', 'swinunet_3ch', 'swinunet_v2'],
+                        choices=['unet', 'redcnn', 'gan', 'swinunet', 'swinunet_fg', 'swinunet_3ch', 'swinunet_v2', 'swinunet_v2_spade'],
                         required=True,
                         help="Pick an architecture from the registry.")
     parser.add_argument('--model_cfg', type=str, default=None,
@@ -321,6 +371,7 @@ def main():
     # (which uses LI to build the soft artifact map A_MG).
     is_swin_fg = args.model.lower() in ("swinunet_fg", "swin_unet_fg", "swinunet-fg", "feature_gating")
     is_swin_3ch = args.model.lower() in ("swinunet_3ch", "swin_unet_3ch", "swinunet-3ch", "three_channel")
+    is_swin_v2_spade = args.model.lower() in ("swinunet_v2_spade", "swin_unet_v2_spade", "swinunet-v2-spade")
     is_gan = args.model.lower() in ("gan", "unet_gan", "patch_gan")
     if args.input_mode == 'ma_li' and not args.li_dir:
         raise ValueError("input_mode='ma_li' requires --li_dir (LI files).")
@@ -328,6 +379,9 @@ def main():
         raise ValueError("--model swinunet_fg requires --li_dir (LI files) to build the artifact map.")
     if is_swin_3ch and not args.li_dir:
         raise ValueError("--model swinunet_3ch requires --li_dir (LI files) to build the [MA, LI, A_MG] input.")
+    if is_swin_v2_spade and not args.li_dir:
+        raise ValueError("--model swinunet_v2_spade requires --li_dir (LI files): the [MA, LI] input and the "
+                         "soft artifact map A_MG = norm(relu(LI - MA)) fed to SPADE are both derived from LI.")
 
     os.makedirs(args.log_dir, exist_ok=True)
 
@@ -357,6 +411,9 @@ def main():
         in_ch = 1
     elif is_swin_3ch:
         in_ch = 3
+    elif is_swin_v2_spade:
+        # 2-channel [MA, LI] input; the soft artifact map A_MG is fed separately to SPADE.
+        in_ch = 2
     else:
         in_ch = 2 if args.input_mode == 'ma_li' else 1
 
@@ -409,7 +466,7 @@ def main():
         ma_dir=args.ma_dir,
         gt_dir=args.gt_dir,
         # LI is loaded whenever input_mode is ma_li OR we're running a model that needs LI.
-        li_dir=args.li_dir if (args.input_mode == 'ma_li' or is_swin_fg or is_swin_3ch) else None,
+        li_dir=args.li_dir if (args.input_mode == 'ma_li' or is_swin_fg or is_swin_3ch or is_swin_v2_spade) else None,
         mask_dir=args.mask_dir,
         split='train',
         hu_min=float(args.hu_min),
@@ -542,6 +599,15 @@ def main():
                     artifact_map = artifact_map / (am_max + 1e-6)
                     x_in = torch.cat([x_batch, li_batch, artifact_map], dim=1)
                     pred = model(x_in)
+                elif is_swin_v2_spade:
+                    # 2-channel [MA, LI] input; soft artifact map A_MG fed to SPADE at every decoder scale.
+                    if li_batch is None:
+                        raise RuntimeError("swinunet_v2_spade requires LI in the batch, but li_batch is None.")
+                    artifact_map = torch.relu(li_batch - x_batch)
+                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                    artifact_map = artifact_map / (am_max + 1e-6)
+                    x_in = torch.cat([x_batch, li_batch], dim=1)
+                    pred = model(x_in, artifact_map=artifact_map)
                 else:
                     if args.input_mode == 'ma_li':
                         if li_batch is None:
@@ -687,6 +753,14 @@ def main():
                         artifact_map = artifact_map / (am_max + 1e-6)
                         x_in = torch.cat([x_batch, li_batch, artifact_map], dim=1)
                         pred = model(x_in)
+                    elif is_swin_v2_spade:
+                        if li_batch is None:
+                            raise RuntimeError("swinunet_v2_spade requires LI in the batch, but li_batch is None.")
+                        artifact_map = torch.relu(li_batch - x_batch)
+                        am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                        artifact_map = artifact_map / (am_max + 1e-6)
+                        x_in = torch.cat([x_batch, li_batch], dim=1)
+                        pred = model(x_in, artifact_map=artifact_map)
                     else:
                         pred = model(x_in)
 

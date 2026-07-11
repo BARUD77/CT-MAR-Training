@@ -1,0 +1,33 @@
+MODEL:
+  TYPE: swin
+  NAME: swin_tiny_patch4_window7_224
+  DROP_PATH_RATE: 0.1
+  PRETRAIN_CKPT: "./pretrained_ckpt/swin_tiny_patch4_window7_224.pth"
+  DROP_RATE: 0.0
+  SWIN:
+    FINAL_UPSAMPLE: "expand_first"
+    EMBED_DIM: 96
+    DEPTHS: [ 2, 2, 2, 2]
+    DECODER_DEPTHS: [ 1,2, 2, 2]
+    NUM_HEADS: [ 3, 6, 12, 24]
+    WINDOW_SIZE: 8
+    PATCH_SIZE: 4
+    IN_CHANS: 2
+    MLP_RATIO: 8
+    QKV_BIAS: TRUE
+    APE: TRUE
+    PATCH_NORM: TRUE
+    NUM_CLASSES: 1
+  # Multiscale SPADE conditioning on the soft artifact map A_MG = norm(relu(LI - MA)).
+  SPADE:
+    USE_SPADE: TRUE
+    STAGES: [0, 1, 2, 3]     # decoder layers_up outputs to modulate (all 4 stages)
+    NORM: "batch"           # param-free BatchNorm2d(affine=False)
+    HIDDEN: 128             # hidden channels of the shared conv head
+    KSIZE: 3                # conv kernel size for gamma/beta heads
+    IDENTITY_INIT: TRUE     # zero-init gamma/beta -> neutral modulation at start
+    ARTIFACT_MAP_CHANS: 1   # channels of the soft artifact map fed to SPADE
+DATA:
+  IMG_SIZE: 512
+TRAIN:
+  USE_CHECKPOINT: FALSE
