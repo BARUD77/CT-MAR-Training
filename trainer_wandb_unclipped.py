@@ -15,7 +15,7 @@ from models.swin_unet_feature_gating.vision_transformer import SwinUnet as SwinU
 from models.swin_unet_three_channel.vision_transformer import SwinUnet as SwinUnet3Ch
 from models.swin_unet_v2.swin_unet_v2 import SwinTransformerSys as SwinUnetV2
 from models.unet import UnetGenerator
-# from models.redcnn import REDCNN
+from models.redcnn import REDCNN
 # from models.gan import Generator as GANGenerator, Discriminator as GANDiscriminator
 
 import numpy as np
