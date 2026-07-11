@@ -298,6 +298,13 @@ def main():
     parser.add_argument('--hu_max', type=float, default=3072.0, help='Maximum HU for clipping before normalization')
     parser.add_argument('--no_clip', action='store_true', help='Disable HU clipping in the dataset (values may go outside [0,1] after normalization).')
 
+    # Residual (global skip) learning
+    parser.add_argument('--residual', action='store_true',
+                        help='Residual learning: the model predicts a correction that is added back to the MA '
+                             'channel, i.e. pred = MA + model(input). The MA channel (channel 0) is always the '
+                             'residual base, even in ma_li / 3ch / feature-gating modes. When the model exposes an '
+                             '"output" conv it is zero-initialized so training starts from the identity (pred = MA).')
+
     # GAN-specific (only used when --model gan)
     parser.add_argument('--gan_lambda_l1', type=float, default=100.0,
                         help='Weight of pixel L1 loss in the generator objective.')
@@ -362,6 +369,17 @@ def main():
         model_cfg_path=args.model_cfg,
         model_kwargs=parse_json_or_none(args.model_kwargs)
     )
+
+    # Residual warm start: zero-init the final output conv so pred starts == MA (identity).
+    if args.residual:
+        out_conv = getattr(model, 'output', None)
+        if isinstance(out_conv, torch.nn.Conv2d):
+            torch.nn.init.zeros_(out_conv.weight)
+            if out_conv.bias is not None:
+                torch.nn.init.zeros_(out_conv.bias)
+            print("[residual] Zero-initialized model.output for identity warm start (pred = MA + f(x)).")
+        else:
+            print("[residual] Residual mode ON, but no zero-initable 'output' conv found; using default init.")
 
     # track gradients/weights (optional)
     wandb.watch(model, log='gradients', log_freq=100)
@@ -533,6 +551,10 @@ def main():
                         x_in = x_batch
                     pred = model(x_in)
 
+            # Residual (global skip): predicted correction is added back to the MA channel.
+            if args.residual:
+                pred = x_batch + pred
+
             if is_gan:
                 # ---- Discriminator step ----
                 optimizer_D.zero_grad(set_to_none=True)
@@ -667,6 +689,10 @@ def main():
                         pred = model(x_in)
                     else:
                         pred = model(x_in)
+
+                # Residual (global skip): predicted correction is added back to the MA channel.
+                if args.residual:
+                    pred = x_batch + pred
 
                 # Cast back to fp32 so downstream numpy-based metrics work with bf16/fp16 autocast.
                 pred = pred.float()
