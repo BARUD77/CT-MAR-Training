@@ -291,10 +291,12 @@ def main():
     parser.add_argument('--model_kwargs', type=str, default=None,
                         help='Optional: JSON dict of kwargs for the chosen model. '
                              'Example: \'{"base_channels":48,"bilinear":true}\'')
-    parser.add_argument('--spade_map', type=str, choices=['soft', 'mask'], default='soft',
+    parser.add_argument('--spade_map', type=str, choices=['soft', 'mask', 'oracle'], default='soft',
                         help="Conditioning source for the SPADE decoder (--model swinunet_v2_spade only): "
                              "'soft' uses A_MG = norm(relu(LI - MA)); 'mask' uses the binary metal mask "
-                             "(requires --mask_dir).")
+                             "(requires --mask_dir); 'oracle' uses A_oracle = norm(relu(GT - MA)), i.e. the same "
+                             "construction computed from the ground truth instead of the LI proxy (upper-bound "
+                             "analysis only -- it leaks the target, so it is not a deployable model).")
 
     # Data & run setup
     parser.add_argument('--ma_dir', type=str, required=True)
@@ -613,6 +615,11 @@ def main():
                         if mask_batch is None:
                             raise RuntimeError("--spade_map mask requires the metal mask in the batch (use --mask_dir).")
                         artifact_map = mask_batch
+                    elif args.spade_map == 'oracle':
+                        # Oracle: same construction as 'soft' but from GT instead of the LI proxy.
+                        artifact_map = torch.relu(y_batch - x_batch)
+                        am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                        artifact_map = artifact_map / (am_max + 1e-6)
                     else:
                         artifact_map = torch.relu(li_batch - x_batch)
                         am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
@@ -771,6 +778,10 @@ def main():
                             if mask_batch is None:
                                 raise RuntimeError("--spade_map mask requires the metal mask in the batch (use --mask_dir).")
                             artifact_map = mask_batch
+                        elif args.spade_map == 'oracle':
+                            artifact_map = torch.relu(y_batch - x_batch)
+                            am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                            artifact_map = artifact_map / (am_max + 1e-6)
                         else:
                             artifact_map = torch.relu(li_batch - x_batch)
                             am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
