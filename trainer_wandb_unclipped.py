@@ -291,6 +291,10 @@ def main():
     parser.add_argument('--model_kwargs', type=str, default=None,
                         help='Optional: JSON dict of kwargs for the chosen model. '
                              'Example: \'{"base_channels":48,"bilinear":true}\'')
+    parser.add_argument('--spade_map', type=str, choices=['soft', 'mask'], default='soft',
+                        help="Conditioning source for the SPADE decoder (--model swinunet_v2_spade only): "
+                             "'soft' uses A_MG = norm(relu(LI - MA)); 'mask' uses the binary metal mask "
+                             "(requires --mask_dir).")
 
     # Data & run setup
     parser.add_argument('--ma_dir', type=str, required=True)
@@ -382,6 +386,8 @@ def main():
     if is_swin_v2_spade and not args.li_dir:
         raise ValueError("--model swinunet_v2_spade requires --li_dir (LI files): the [MA, LI] input and the "
                          "soft artifact map A_MG = norm(relu(LI - MA)) fed to SPADE are both derived from LI.")
+    if is_swin_v2_spade and args.spade_map == 'mask' and not args.mask_dir:
+        raise ValueError("--spade_map mask requires --mask_dir so the binary metal mask is available for SPADE.")
 
     os.makedirs(args.log_dir, exist_ok=True)
 
@@ -600,12 +606,17 @@ def main():
                     x_in = torch.cat([x_batch, li_batch, artifact_map], dim=1)
                     pred = model(x_in)
                 elif is_swin_v2_spade:
-                    # 2-channel [MA, LI] input; soft artifact map A_MG fed to SPADE at every decoder scale.
+                    # 2-channel [MA, LI] input; conditioning map fed to SPADE at every decoder scale.
                     if li_batch is None:
                         raise RuntimeError("swinunet_v2_spade requires LI in the batch, but li_batch is None.")
-                    artifact_map = torch.relu(li_batch - x_batch)
-                    am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
-                    artifact_map = artifact_map / (am_max + 1e-6)
+                    if args.spade_map == 'mask':
+                        if mask_batch is None:
+                            raise RuntimeError("--spade_map mask requires the metal mask in the batch (use --mask_dir).")
+                        artifact_map = mask_batch
+                    else:
+                        artifact_map = torch.relu(li_batch - x_batch)
+                        am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                        artifact_map = artifact_map / (am_max + 1e-6)
                     x_in = torch.cat([x_batch, li_batch], dim=1)
                     pred = model(x_in, artifact_map=artifact_map)
                 else:
@@ -756,9 +767,14 @@ def main():
                     elif is_swin_v2_spade:
                         if li_batch is None:
                             raise RuntimeError("swinunet_v2_spade requires LI in the batch, but li_batch is None.")
-                        artifact_map = torch.relu(li_batch - x_batch)
-                        am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
-                        artifact_map = artifact_map / (am_max + 1e-6)
+                        if args.spade_map == 'mask':
+                            if mask_batch is None:
+                                raise RuntimeError("--spade_map mask requires the metal mask in the batch (use --mask_dir).")
+                            artifact_map = mask_batch
+                        else:
+                            artifact_map = torch.relu(li_batch - x_batch)
+                            am_max = artifact_map.amax(dim=(2, 3), keepdim=True)
+                            artifact_map = artifact_map / (am_max + 1e-6)
                         x_in = torch.cat([x_batch, li_batch], dim=1)
                         pred = model(x_in, artifact_map=artifact_map)
                     else:
