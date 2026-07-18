@@ -219,8 +219,46 @@ def build_model(name: str,
             **model_kwargs
         )
         return m.to(device)
+    elif name in ("marmamba", "mamba", "mambaformer"):
+        # MARMamba (Mamba-based U-shaped MAR net). MA-only, 1-ch in == 1-ch out.
+        # Lazy import: all MARMAMBA models pull in `mamba_ssm` at module import,
+        # so only import when actually selected.
+        from MARMAMBA.model.mamba import MambaFormer
+        depth = model_kwargs.pop("depth", [1, 2, 2, 4, 1])
+        dim = int(model_kwargs.pop("dim", 12))
+        input_size = int(model_kwargs.pop("input_size", 256))  # cosmetic; net is size-dynamic
+        m = MambaFormer(input_size=input_size, in_channels=in_ch,
+                        depth=list(depth), dim=dim, **model_kwargs)
+        return m.to(device)
+    elif name in ("marvit", "vit", "vitformer"):
+        from MARMAMBA.model.vit import ViTFormer
+        depth = model_kwargs.pop("depth", [1, 2, 2, 4, 1])
+        num_heads = model_kwargs.pop("num_heads", [4, 6, 6, 8])
+        dim = int(model_kwargs.pop("dim", 12))
+        input_size = int(model_kwargs.pop("input_size", 256))
+        m = ViTFormer(input_size=input_size, in_channels=in_ch, depth=list(depth),
+                      num_heads=list(num_heads), dim=dim, **model_kwargs)
+        return m.to(device)
+    elif name in ("marpvt", "pvt", "pvtformer"):
+        from MARMAMBA.model.pvt import PVTFormer
+        depth = model_kwargs.pop("depth", [1, 2, 2, 4, 1])
+        num_heads = model_kwargs.pop("num_heads", [4, 6, 6, 8])
+        sra_size = model_kwargs.pop("sra_size", [7, 7, 7, 7])
+        dim = int(model_kwargs.pop("dim", 12))
+        input_size = int(model_kwargs.pop("input_size", 256))
+        m = PVTFormer(input_size=input_size, in_channels=in_ch, depth=list(depth),
+                      num_heads=list(num_heads), sra_size=list(sra_size), dim=dim, **model_kwargs)
+        return m.to(device)
+    elif name in ("marformer",):
+        from MARMAMBA.model.marformer import MARformer
+        depth = model_kwargs.pop("depth", [1, 2, 3, 4])
+        num_heads = model_kwargs.pop("num_heads", [1, 2, 4, 8])
+        dim = int(model_kwargs.pop("dim", 48))
+        m = MARformer(dim=dim, depth=list(depth), num_heads=list(num_heads),
+                      in_channels=in_ch, **model_kwargs)
+        return m.to(device)
     else:
-        raise ValueError(f"Unknown model: {name}. Supported: unet, redcnn, gan, swinunet, swinunet_fg, swinunet_3ch, swinunet_v2")
+        raise ValueError(f"Unknown model: {name}. Supported: unet, redcnn, gan, swinunet, swinunet_fg, swinunet_3ch, swinunet_v2, swinunet_v2_spade, marmamba, marvit, marpvt, marformer")
 
 def param_groups(model, wd, nowd_names=('bias', 'bn', 'norm')):
     decay, no_decay = [], []
@@ -278,12 +316,43 @@ def recon_loss(pred, target, mask_batch, l1_fn, ssim_weight=0.0, ssim_dilation=2
         total = total + float(ssim_weight) * (1.0 - ssim_val)
     return total
 
+
+def charbonnier_loss(pred, target, mask_batch=None, eps=0.03):
+    """MARMamba's `hub_loss`: sqrt((pred-target)^2 + eps^2) - eps.
+
+    The paper averages over the whole image; here the metal region is excluded
+    when a mask is available, to stay consistent with the rest of this trainer
+    (metal is dropped from every loss/metric). Pass mask_batch=None for the
+    plain full-image mean used in the paper.
+    """
+    diff = torch.sqrt((pred - target) ** 2 + eps * eps) - eps
+    if mask_batch is not None:
+        valid = (mask_batch <= 0.5).float()
+        denom = valid.sum().clamp_min(1.0)
+        return (diff * valid).sum() / denom
+    return diff.mean()
+
+
+def marmamba_loss(pred, target, mask_batch, lpips_fn, alpha=0.8, beta=0.2, eps=0.03):
+    """MARMamba paper loss: alpha * Charbonnier + beta * LPIPS(VGG).
+
+    LPIPS expects 3-channel inputs, so the single CT channel is replicated to RGB.
+    The LPIPS term is computed in fp32 (autocast disabled) for stability under AMP.
+    """
+    charb = charbonnier_loss(pred, target, mask_batch, eps)
+    p3 = pred.float().repeat(1, 3, 1, 1)
+    t3 = target.float().repeat(1, 3, 1, 1)
+    with torch.autocast(device_type=p3.device.type, enabled=False):
+        lp = lpips_fn(p3, t3).mean()
+    return alpha * charb + beta * lp
+
 # ----------------------------- Main -----------------------------
 def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
     # Model selection / config
     parser.add_argument('--model', type=str,
-                        choices=['unet', 'redcnn', 'gan', 'swinunet', 'swinunet_fg', 'swinunet_3ch', 'swinunet_v2', 'swinunet_v2_spade'],
+                        choices=['unet', 'redcnn', 'gan', 'swinunet', 'swinunet_fg', 'swinunet_3ch', 'swinunet_v2', 'swinunet_v2_spade',
+                                 'marmamba', 'marvit', 'marpvt', 'marformer'],
                         required=True,
                         help="Pick an architecture from the registry.")
     parser.add_argument('--model_cfg', type=str, default=None,
@@ -336,6 +405,17 @@ def main():
     parser.add_argument('--ssim_loss_dilation', type=int, default=2,
                         help='Pixels to dilate the metal mask before excluding it from the SSIM-map average '
                              '(drops windows that straddle the metal boundary).')
+    # Loss selection: 'recon' (masked L1 + optional masked SSIM) or 'marmamba' (paper loss).
+    parser.add_argument('--loss', type=str, default='recon', choices=['recon', 'marmamba'],
+                        help="'recon' (default) = masked L1 (+ optional masked SSIM). "
+                             "'marmamba' = loss_alpha*Charbonnier(c) + loss_beta*LPIPS(vgg), the MARMamba paper loss "
+                             "(requires the `lpips` package).")
+    parser.add_argument('--loss_alpha', type=float, default=0.8,
+                        help='Weight of the Charbonnier term for --loss marmamba (paper: 0.8).')
+    parser.add_argument('--loss_beta', type=float, default=0.2,
+                        help='Weight of the LPIPS term for --loss marmamba (paper: 0.2).')
+    parser.add_argument('--charbonnier_eps', type=float, default=0.03,
+                        help='Charbonnier constant c for --loss marmamba (paper: 0.03).')
     parser.add_argument('--amp', action='store_true',
                         help='Enable automatic mixed precision (autocast). Big speedup on A100/Ampere+ GPUs. '
                              'No-op on CPU.')
@@ -379,6 +459,19 @@ def main():
     is_swin_3ch = args.model.lower() in ("swinunet_3ch", "swin_unet_3ch", "swinunet-3ch", "three_channel")
     is_swin_v2_spade = args.model.lower() in ("swinunet_v2_spade", "swin_unet_v2_spade", "swinunet-v2-spade")
     is_gan = args.model.lower() in ("gan", "unet_gan", "patch_gan")
+    # MARMamba family (Mamba/ViT/PVT/MARformer): MA-only, 1-ch in==out, internal global residual.
+    is_marmamba = args.model.lower() in (
+        "marmamba", "mamba", "mambaformer",
+        "marvit", "vit", "vitformer",
+        "marpvt", "pvt", "pvtformer",
+        "marformer",
+    )
+    if is_marmamba and args.input_mode == 'ma_li':
+        raise ValueError("MARMamba-family models (marmamba/marvit/marpvt/marformer) are MA-only "
+                         "(1-channel in == 1-channel out). Use --input_mode ma (the default).")
+    if is_marmamba and args.residual:
+        raise ValueError("MARMamba-family models already apply an internal global residual "
+                         "(out = f(x) + x). Do NOT pass --residual, it would double-add the skip.")
     if args.input_mode == 'ma_li' and not args.li_dir:
         raise ValueError("input_mode='ma_li' requires --li_dir (LI files).")
     if is_swin_fg and not args.li_dir:
@@ -422,6 +515,9 @@ def main():
     elif is_swin_v2_spade:
         # 2-channel [MA, LI] input; the soft artifact map A_MG is fed separately to SPADE.
         in_ch = 2
+    elif is_marmamba:
+        # MA-only; the model's out_channels are tied to in_channels via the internal residual.
+        in_ch = 1
     else:
         in_ch = 2 if args.input_mode == 'ma_li' else 1
 
@@ -506,6 +602,17 @@ def main():
     optimizer = torch.optim.AdamW(param_groups(model, wd=1e-4),
                               lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8)
     loss_fn = torch.nn.L1Loss()
+
+    # Optional MARMamba paper loss: alpha*Charbonnier + beta*LPIPS(vgg).
+    lpips_fn = None
+    if args.loss == 'marmamba':
+        import lpips  # lazy import: only needed for this loss
+        lpips_fn = lpips.LPIPS(net='vgg', spatial=False).to(device)
+        for p in lpips_fn.parameters():
+            p.requires_grad_(False)
+        lpips_fn.eval()
+        print(f"[loss] MARMamba loss: {args.loss_alpha}*Charbonnier(c={args.charbonnier_eps}) "
+              f"+ {args.loss_beta}*LPIPS(vgg).")
 
     # ---------------- LR schedule: linear warmup + cosine decay (per-iteration) ----------------
     steps_per_epoch = max(1, len(train_loader))
@@ -626,6 +733,13 @@ def main():
                         artifact_map = artifact_map / (am_max + 1e-6)
                     x_in = torch.cat([x_batch, li_batch], dim=1)
                     pred = model(x_in, artifact_map=artifact_map)
+                elif is_marmamba:
+                    # MA-only. Apply the [-1,1] input convention (Normalize(0.5,0.5))
+                    # these models were trained with on SynDeepLesion: zero-centering the
+                    # input matches the distribution the arch/init assume. The model applies
+                    # its own internal global residual (out = f(x)+x); GT stays in [0,1].
+                    x_in = x_batch * 2.0 - 1.0
+                    pred = model(x_in)
                 else:
                     if args.input_mode == 'ma_li':
                         if li_batch is None:
@@ -663,9 +777,14 @@ def main():
                 train_loss_g_l1 += float(loss_g_l1.item())
             else:
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                    loss = recon_loss(pred, y_batch, mask_batch, loss_fn,
-                                      ssim_weight=args.ssim_loss_weight,
-                                      ssim_dilation=args.ssim_loss_dilation)
+                    if args.loss == 'marmamba':
+                        loss = marmamba_loss(pred, y_batch, mask_batch, lpips_fn,
+                                             alpha=args.loss_alpha, beta=args.loss_beta,
+                                             eps=args.charbonnier_eps)
+                    else:
+                        loss = recon_loss(pred, y_batch, mask_batch, loss_fn,
+                                          ssim_weight=args.ssim_loss_weight,
+                                          ssim_dilation=args.ssim_loss_dilation)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -788,6 +907,10 @@ def main():
                             artifact_map = artifact_map / (am_max + 1e-6)
                         x_in = torch.cat([x_batch, li_batch], dim=1)
                         pred = model(x_in, artifact_map=artifact_map)
+                    elif is_marmamba:
+                        # MA-only, [-1,1] input convention (matches training-time forward).
+                        x_in = x_batch * 2.0 - 1.0
+                        pred = model(x_in)
                     else:
                         pred = model(x_in)
 
