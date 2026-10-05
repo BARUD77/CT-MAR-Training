@@ -1,0 +1,83 @@
+# FIND-Net baseline configuration. Every value can be overridden from the CLI where noted
+# (see train_findnet.py --help).
+#
+# Source tags:
+#   [orig]   FIND-Net repo, commit in third_party/findnet/COMMIT.txt (test.sh / test_FINDNet.py /
+#            Dataset/dataset.py / Model/*.py)
+#   [paper]  FIND-Net paper, arXiv 2508.10617v1, Sec. 3.1 ("Experimental Setup and Training Configuration")
+#   [dicd]   DICDNet train_DICDNet.py (hongwang01/DICDNet @ 6498998a) -- FIND-Net ships no training code
+#            and the paper says it follows DICDNet's configuration
+#   [user]   decided by the user (see PROGRESS.md)
+#   [mine]   set for this project / my data -- NEEDS USER CONFIRMATION where marked (?)
+
+data:
+  # Data paths are config entries (or CLI --ma_dir/--gt_dir/--li_dir/--mask_dir). Defaults below are
+  # the Colab layout used by FINDNet_training.ipynb after unzipping the bucket. [mine]
+  ma_dir: /content/data/MA/MA_image
+  gt_dir: /content/data/GT/GT
+  li_dir: /content/data/LI/LI
+  mask_dir: /content/data/mask/metal_mask
+  num_workers: 8                 # [mine] DataLoader workers
+  # Dataset args (hu_min/hu_max/clip/output_space/region/seed/val_size) are FIXED in
+  # baselines/common/data.py (CLAUDE.md) and intentionally not configurable here.
+
+model:
+  gaussian_filter: true          # [user D1][paper] full FIND-Net (repo default in ffc.py is False = No-GF)
+  S: 10                          # [orig test.sh][paper] stages
+  num_M: 32                      # [orig test.sh]
+  num_Q: 32                      # [orig test.sh]
+  T: 3                           # [orig test.sh] ResBlocks per proxNet
+  etaM: 1.0                      # [orig test.sh]
+  etaX: 5.0                      # [orig test.sh]
+  materialize_aliased_params: true  # [mine](?) required to train/resume at all with current PyTorch (D2)
+
+adapter:
+  normalization: scale255        # [mine](?) scale255 = 255 * my_norm ; native_window = FIND-Net HU window
+  augment_flips: true            # [orig Dataset/dataset.py] random hflip p=0.5 + vflip p=0.5 (train only)
+
+loss:                            # Eq. 6 of the paper, weights from [dicd]
+  stage_weight: 0.1              # [dicd] w_s for X0, X_0..X_{S-1}, A_0..A_{S-1}; final stage weight 1.0
+  Xl2: 1.0                       # [dicd] weight of the MSE (Frobenius) terms
+  Xl1: 5.0e-4                    # [dicd] gamma_1, weight of the summed-L1 image terms
+  Al1: 5.0e-4                    # [user D3] gamma_2 (DICDNet code literally has 54-4 = 50)
+
+optim:
+  lr: 1.0e-4                     # [paper]
+  betas: [0.9, 0.999]            # [paper] AdamW
+  weight_decay: 1.0e-5           # [paper]
+  # No gradient clipping [dicd].
+
+schedule:                        # [paper] "linear warmup with cosine annealing"; stepped per iteration
+  warmup_epochs: 5               # [mine](?) warmup length not given in the paper
+  min_lr_ratio: 0.0              # [mine](?) cosine decays to min_lr_ratio * lr
+
+train:
+  epochs: 200                    # [paper] "up to 200 epochs" (budget to be confirmed after Colab timing)
+  batch_size: 6                  # [paper]
+  image_size: full               # [orig][paper] full 512x512 slices, no patches (informational)
+  tf32: true                     # [mine](?) allow TF32 matmul/conv on A100 (as trainer_wandb_unclipped.py)
+  cudnn_benchmark: true          # [dicd] cudnn.benchmark = True
+  precision: fp32                # [mine](?) no AMP (paper unspecified; FFT layers + fp16 are fragile)
+  early_stop_patience: 0         # [mine](?) 0 = off. Paper: early stopping on val loss (patience not given)
+  seed: 42                       # [mine] torch/numpy/python seed for init + shuffling
+  log_every_iters: 50            # [mine] W&B train logging interval
+
+validation:
+  batch_size: 6                  # [mine]
+  every_epochs: 1                # [mine](?) validate every k epochs (always after the last epoch)
+  # Metrics: baselines/common/eval_utils.py on the FINAL stage output converted back to [0,1].
+  # best.pt is selected by validation masked SSIM [user TASK.md]. The original loss on the val set
+  # is also logged (val/loss) for reference.
+
+checkpoint:
+  ckpt_dir: /content/drive/MyDrive/MAR_project/runs/findnet   # [mine](?) Google Drive folder
+  save_every_iters: 1000         # [mine](?) last.pt also every N optimizer steps (plus every epoch)
+  local_tmp_dir: /content/ckpt_tmp  # [mine] local disk staging for atomic saves (null = system temp)
+
+wandb:
+  project: ct-mar                # [mine](?) project used by the existing Colab notebook
+  entity: null
+  run_name: gf                   # final name is prefixed: findnet_gf
+  mode: online                   # online | offline | disabled (disabled = no wandb import at all)
+  # Login happens in the Colab notebook (Colab secret WANDB_API_KEY -> wandb.login, stored in ~/.netrc);
+  # the training subprocess then reuses that login. The key is never stored in code or config.
