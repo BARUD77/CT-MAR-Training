@@ -654,6 +654,9 @@ def main():
         val_ds.pairs = val_ds.pairs[:args.debug_max_val_samples]
     # Ensure perfect alignment between the two val loaders
     val_ds_hu.pairs = val_ds.pairs
+    # Region label per val slice, in val_loader order (shuffle=False). Parsed from the MA filename
+    # the same way aapm_dataset does (training_{body|head}_...). Used only for stratified reporting.
+    val_regions = ["head" if "_head_" in os.path.basename(p[0]).lower() else "body" for p in val_ds.pairs]
 
     pin = (device.type == 'cuda')
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=pin)
@@ -884,8 +887,10 @@ def main():
                     # these models were trained with on SynDeepLesion: zero-centering the
                     # input matches the distribution the arch/init assume. The model applies
                     # its own internal global residual (out = f(x)+x); GT stays in [0,1].
+                    # Map the output back to [0,1] so the internal residual is an identity
+                    # on MA at init: (f(x')+x'+1)/2 = MA + f(x')/2, with x' = 2*MA-1.
                     x_in = x_batch * 2.0 - 1.0
-                    pred = model(x_in)
+                    pred = (model(x_in) + 1.0) * 0.5
                 else:
                     if args.input_mode == 'ma_li':
                         if li_batch is None:
@@ -1089,9 +1094,9 @@ def main():
                         x_in = torch.cat([x_batch, li_batch], dim=1)
                         pred = model(x_in, artifact_map=artifact_map)
                     elif is_marmamba:
-                        # MA-only, [-1,1] input convention (matches training-time forward).
+                        # MA-only, [-1,1] in / [0,1] out (matches training-time forward).
                         x_in = x_batch * 2.0 - 1.0
-                        pred = model(x_in)
+                        pred = (model(x_in) + 1.0) * 0.5
                     else:
                         pred = model(x_in)
 
@@ -1113,6 +1118,21 @@ def main():
         avg_ssim, std_ssim = val_summary["ssim"], val_summary["ssim_std"]
         avg_rmse, std_rmse = val_summary["rmse"], val_summary["rmse_std"]
 
+        # Body vs head breakdown of the same per-image metrics (reporting only; best.pt and early
+        # stopping still use the overall SSIM above).
+        if len(ssim_list) != len(val_regions):
+            raise RuntimeError(f"val metrics ({len(ssim_list)}) / region labels ({len(val_regions)}) mismatch")
+        region_summaries = {}
+        for region in ("body", "head"):
+            idx = [i for i, r in enumerate(val_regions) if r == region]
+            if idx:
+                region_summaries[region] = summarize_metrics({
+                    "psnr": [psnr_list[i] for i in idx],
+                    "ssim": [ssim_list[i] for i in idx],
+                    "rmse": [rmse_list[i] for i in idx],
+                })
+                region_summaries[region]["n"] = len(idx)
+
         # ---------------- Log to W&B ----------------
         log_payload = {
                 "loss": avg_loss,
@@ -1125,6 +1145,9 @@ def main():
                 "lr": optimizer.param_groups[0]["lr"],
                 "epoch": epoch,
         }
+        for region, rs in region_summaries.items():
+            for k in ("psnr", "psnr_std", "ssim", "ssim_std", "rmse", "rmse_std", "n"):
+                log_payload[f"val_{region}/{k}"] = rs[k]
         if is_gan:
             log_payload["gan/loss_d"] = avg_loss_d
             log_payload["gan/loss_g_adv"] = avg_loss_g_adv
@@ -1145,6 +1168,13 @@ def main():
             f"SSIM: {avg_ssim:.4f} \u00b1 {std_ssim:.4f} "
             f"RMSE: {avg_rmse:.2f} \u00b1 {std_rmse:.2f} HU"
         )
+        for region, rs in region_summaries.items():
+            print(
+                f"    [{region} n={rs['n']}] "
+                f"PSNR: {rs['psnr']:.2f} \u00b1 {rs['psnr_std']:.2f} "
+                f"SSIM: {rs['ssim']:.4f} \u00b1 {rs['ssim_std']:.4f} "
+                f"RMSE: {rs['rmse']:.2f} \u00b1 {rs['rmse_std']:.2f} HU"
+            )
         if is_pix2pix:
             print(f"    [pix2pix] loss_d={avg_loss_d:.4f} loss_g_adv={avg_loss_g_adv:.4f} "
                   f"loss_g_l1={avg_loss_g_l1:.4f} D(real)={avg_d_real_mean:.3f} D(fake)={avg_d_fake_mean:.3f} "
