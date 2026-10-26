@@ -3,6 +3,7 @@ import argparse
 import os
 import json
 import math
+import warnings
 import torch
 import yaml
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from models.swin_unet_v2.swin_unet_v2 import SwinTransformerSys as SwinUnetV2
 from models.swin_unet_v2_SPADE_multiscale_soft_art_map.swin_unet_v2 import SwinTransformerSys as SwinUnetV2Spade
 from models.unet import UnetGenerator
 from models.redcnn import REDCNN
+from models.pix2pix import Pix2PixGenerator, PatchGANDiscriminator
 # from models.gan import Generator as GANGenerator, Discriminator as GANDiscriminator
 
 import numpy as np
@@ -90,6 +92,11 @@ def build_model(name: str,
             bottleneck=bottleneck,
             **model_kwargs
         )
+        return m.to(device)
+    elif name == "pix2pix":
+        # pix2pix U-Net generator; the PatchGAN discriminator is built separately in main().
+        # Accepted kwargs: ngf, num_downs, use_dropout, norm, output_activation.
+        m = Pix2PixGenerator(in_channels=in_ch, out_channels=num_classes, **model_kwargs)
         return m.to(device)
     elif name in ("swinunet", "swin_unet", "swin-u"):
         if not model_cfg_path:
@@ -259,7 +266,7 @@ def build_model(name: str,
                       in_channels=in_ch, **model_kwargs)
         return m.to(device)
     else:
-        raise ValueError(f"Unknown model: {name}. Supported: unet, redcnn, gan, swinunet, swinunet_fg, swinunet_3ch, swinunet_v2, swinunet_v2_spade, marmamba, marvit, marpvt, marformer")
+        raise ValueError(f"Unknown model: {name}. Supported: unet, redcnn, gan, pix2pix, swinunet, swinunet_fg, swinunet_3ch, swinunet_v2, swinunet_v2_spade, marmamba, marvit, marpvt, marformer")
 
 def param_groups(model, wd, nowd_names=('bias', 'bn', 'norm')):
     decay, no_decay = [], []
@@ -352,7 +359,7 @@ def main():
     parser = argparse.ArgumentParser(description="Training script (W&B only, model-agnostic)")
     # Model selection / config
     parser.add_argument('--model', type=str,
-                        choices=['unet', 'redcnn', 'gan', 'swinunet', 'swinunet_fg', 'swinunet_3ch', 'swinunet_v2', 'swinunet_v2_spade',
+                        choices=['unet', 'redcnn', 'gan', 'pix2pix', 'swinunet', 'swinunet_fg', 'swinunet_3ch', 'swinunet_v2', 'swinunet_v2_spade',
                                  'marmamba', 'marvit', 'marpvt', 'marformer'],
                         required=True,
                         help="Pick an architecture from the registry.")
@@ -450,7 +457,30 @@ def main():
     parser.add_argument('--gan_d_lr', type=float, default=2e-4,
                         help='Learning rate for the GAN discriminator (Adam).')
     parser.add_argument('--gan_d_beta1', type=float, default=0.5,
-                        help='Adam beta1 for the GAN discriminator.')
+                        help='Adam beta1 for the GAN discriminator (--model gan only).')
+
+    # pix2pix-specific (only used when --model pix2pix; also reuses --gan_d_lr,
+    # --gan_lambda_l1, --gan_lambda_adv)
+    parser.add_argument('--gan_g_lr', type=float, default=2e-4,
+                        help='pix2pix: generator learning rate (Adam). Replaces --learning_rate for pix2pix.')
+    parser.add_argument('--gan_beta1', type=float, default=0.5,
+                        help='pix2pix: Adam beta1 for both G and D (beta2 = 0.999).')
+    parser.add_argument('--gan_lr_policy', type=str, default='pix2pix', choices=['pix2pix', 'trainer'],
+                        help="pix2pix: 'pix2pix' = constant LR for the first half of --epochs, then linear "
+                             "decay to 0 (per epoch, upstream formula); 'trainer' = this trainer's per-iteration "
+                             "warmup + cosine (--warmup_epochs, --min_lr_ratio). Applied to G and D.")
+
+    # Resume (all models)
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to a last.pt to resume from. Restores model, optimizer(s), scheduler(s), '
+                             'scaler, epoch, best SSIM and early-stop counter when present. Old '
+                             'model_state-only checkpoints load the weights and fast-forward the LR schedule.')
+
+    # Debug-only subsetting (0 = off). Truncates the fixed train/val split; never use for real runs.
+    parser.add_argument('--debug_max_train_samples', type=int, default=0,
+                        help='DEBUG: keep only the first N training slices (0 = all).')
+    parser.add_argument('--debug_max_val_samples', type=int, default=0,
+                        help='DEBUG: keep only the first N validation slices (0 = all).')
 
     args = parser.parse_args()
 
@@ -460,6 +490,10 @@ def main():
     is_swin_3ch = args.model.lower() in ("swinunet_3ch", "swin_unet_3ch", "swinunet-3ch", "three_channel")
     is_swin_v2_spade = args.model.lower() in ("swinunet_v2_spade", "swin_unet_v2_spade", "swinunet-v2-spade")
     is_gan = args.model.lower() in ("gan", "unet_gan", "patch_gan")
+    is_pix2pix = args.model.lower() == "pix2pix"
+    if is_pix2pix and args.residual:
+        raise ValueError("--residual is not supported with --model pix2pix (the upstream U-Net predicts the "
+                         "image directly; output_activation='tanh' would also break pred = MA + f(x)).")
     # MARMamba family (Mamba/ViT/PVT/MARformer): MA-only, 1-ch in==out, internal global residual.
     is_marmamba = args.model.lower() in (
         "marmamba", "mamba", "mambaformer",
@@ -523,13 +557,21 @@ def main():
         in_ch = 2 if args.input_mode == 'ma_li' else 1
 
     # ---------------- Build model ----------------
+    model_kwargs = parse_json_or_none(args.model_kwargs)
+    if is_pix2pix:
+        model_kwargs = dict(model_kwargs or {})
+        # Dataset targets lie in [0, 1] only when HU clipping is on. With --no_clip they can fall
+        # outside, which a tanh output cannot represent -> linear output by default.
+        model_kwargs.setdefault("output_activation", "none" if args.no_clip else "tanh")
+        print(f"[pix2pix] generator kwargs: {model_kwargs} (no_clip={args.no_clip})")
     model = build_model(
         name=args.model,
         in_ch=in_ch,
         num_classes=args.num_classes,
         device=device,
         model_cfg_path=args.model_cfg,
-        model_kwargs=parse_json_or_none(args.model_kwargs)
+        # Copy: build_model pops entries; the original dict is stored in checkpoints.
+        model_kwargs=dict(model_kwargs) if model_kwargs is not None else None
     )
 
     # Residual warm start: zero-init the final output conv so pred starts == MA (identity).
@@ -563,6 +605,22 @@ def main():
               f"lambda_l1={args.gan_lambda_l1}, lambda_adv={args.gan_lambda_adv}, "
               f"d_lr={args.gan_d_lr}, d_beta1={args.gan_d_beta1}")
 
+    # ---------------- (pix2pix only) Conditional PatchGAN + its optimizer ----------------
+    bce_logits = None
+    if is_pix2pix:
+        discriminator = PatchGANDiscriminator(
+            in_channels=in_ch + args.num_classes,
+            norm=model_kwargs.get("norm", "batch"),
+        ).to(device)
+        optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=args.gan_d_lr,
+                                       betas=(args.gan_beta1, 0.999), weight_decay=0.0)
+        bce_logits = torch.nn.BCEWithLogitsLoss()
+        wandb.watch(discriminator, log='gradients', log_freq=100)
+        print(f"[pix2pix] D = 70x70 PatchGAN on {in_ch}+{args.num_classes} channels. "
+              f"g_lr={args.gan_g_lr}, d_lr={args.gan_d_lr}, beta1={args.gan_beta1}, "
+              f"lambda_l1={args.gan_lambda_l1} (x2 masked L1), lambda_adv={args.gan_lambda_adv}, "
+              f"lr_policy={args.gan_lr_policy}. --learning_rate / --loss / --ssim_loss_weight are ignored.")
+
     # ---------------- Dataset / loaders ----------------
 
     # Our CTMetalArtifactDataset (patched) requires li_dir when we want LI returned.
@@ -589,6 +647,11 @@ def main():
     val_ds   = CTMetalArtifactDataset(**{**dataset_kwargs, "split": "val"})
     # HU validation dataset for HU-domain metrics (no extra np.load inside the loop)
     val_ds_hu = CTMetalArtifactDataset(**{**dataset_kwargs, "split": "val", "output_space": "hu"})
+    # DEBUG-only truncation of the fixed split (default off).
+    if args.debug_max_train_samples > 0:
+        train_ds.pairs = train_ds.pairs[:args.debug_max_train_samples]
+    if args.debug_max_val_samples > 0:
+        val_ds.pairs = val_ds.pairs[:args.debug_max_val_samples]
     # Ensure perfect alignment between the two val loaders
     val_ds_hu.pairs = val_ds.pairs
 
@@ -600,8 +663,13 @@ def main():
     print(f"Training on {len(train_ds)} samples, validating on {len(val_ds)} samples.")
 
     # ---------------- Optimizer / loss ----------------
-    optimizer = torch.optim.AdamW(param_groups(model, wd=1e-4),
-                              lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8)
+    if is_pix2pix:
+        # Upstream pix2pix: plain Adam, betas=(0.5, 0.999), no weight decay.
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.gan_g_lr,
+                                     betas=(args.gan_beta1, 0.999), weight_decay=0.0)
+    else:
+        optimizer = torch.optim.AdamW(param_groups(model, wd=1e-4),
+                                  lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8)
     loss_fn = torch.nn.L1Loss()
 
     # Optional MARMamba paper loss: alpha*Charbonnier + beta*LPIPS(vgg).
@@ -631,7 +699,23 @@ def main():
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # pix2pix: G and D share one policy. 'pix2pix' is stepped once per epoch (upstream
+    # 'linear' policy with n_epochs = ceil(E/2), n_epochs_decay = E - n_epochs); 'trainer'
+    # reuses lr_lambda above and is stepped per iteration like every other model.
+    sched_per_iter = not (is_pix2pix and args.gan_lr_policy == 'pix2pix')
+    g_lambda = lr_lambda
+    if not sched_per_iter:
+        n_const = (args.epochs + 1) // 2
+        n_decay = args.epochs - n_const
+
+        def p2p_lambda(epoch_idx):
+            # epoch_idx = number of completed epochs (0-based), as in upstream get_scheduler.
+            return 1.0 - max(0, epoch_idx + 1 - n_const) / float(n_decay + 1)
+
+        g_lambda = p2p_lambda
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, g_lambda)
+    scheduler_D = torch.optim.lr_scheduler.LambdaLR(optimizer_D, g_lambda) if is_pix2pix else None
 
     # ---------------- Mixed precision (AMP) ----------------
     amp_enabled = bool(args.amp) and device.type == 'cuda'
@@ -646,13 +730,74 @@ def main():
     best_ckpt_path = None
     epochs_since_improve = 0  # for early stopping
 
+    # ---------------- Resume ----------------
+    start_epoch = 1
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        if not isinstance(ckpt, dict):
+            raise ValueError(f"--resume: unsupported checkpoint format in {args.resume}")
+        model.load_state_dict(ckpt.get("model_state", ckpt))
+        done_epochs = int(ckpt.get("epoch", 0))
+        start_epoch = done_epochs + 1
+
+        def _fast_forward(sched):
+            # Legacy checkpoints have no scheduler state: replay the schedule to where it was.
+            n_steps = done_epochs * steps_per_epoch if sched_per_iter else done_epochs
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # "scheduler.step() before optimizer.step()"
+                for _ in range(n_steps):
+                    sched.step()
+
+        def _sync_lr(sched):
+            # The restored optimizer carries the LR of the old schedule; recompute it from the
+            # current lambda (differs when --epochs changed between runs, no-op otherwise).
+            lrs = [base * fn(sched.last_epoch) for base, fn in zip(sched.base_lrs, sched.lr_lambdas)]
+            for group, lr in zip(sched.optimizer.param_groups, lrs):
+                group["lr"] = lr
+            sched._last_lr = lrs
+
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+            _sync_lr(scheduler)
+            if scaler.is_enabled() and ckpt.get("scaler_state"):
+                scaler.load_state_dict(ckpt["scaler_state"])
+            best_ssim = float(ckpt.get("best_ssim", best_ssim))
+            epochs_since_improve = int(ckpt.get("epochs_since_improve", 0))
+        else:
+            print("[resume] Legacy checkpoint (weights only): optimizer/scaler state reset, "
+                  "LR schedule fast-forwarded, best SSIM taken from best.pt if present.")
+            _fast_forward(scheduler)
+            prev_best = os.path.join(args.log_dir, "best.pt")
+            if os.path.isfile(prev_best):
+                try:
+                    best_ssim = float(torch.load(prev_best, map_location="cpu").get("monitor_value", best_ssim))
+                except Exception as e:
+                    print(f"[resume] Could not read monitor_value from {prev_best}: {e}")
+
+        if is_pix2pix:
+            if "discriminator_state" in ckpt:
+                discriminator.load_state_dict(ckpt["discriminator_state"])
+                optimizer_D.load_state_dict(ckpt["optimizer_D_state"])
+                scheduler_D.load_state_dict(ckpt["scheduler_D_state"])
+                _sync_lr(scheduler_D)
+            else:
+                print("[resume] No discriminator state in checkpoint: D starts from scratch.")
+                _fast_forward(scheduler_D)
+
+        print(f"[resume] Loaded {args.resume}: continuing at epoch {start_epoch}/{args.epochs}, "
+              f"best_ssim={best_ssim:.4f}, epochs_since_improve={epochs_since_improve}, "
+              f"lr={optimizer.param_groups[0]['lr']:.3e}")
+
     # Training loop
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         train_loss = 0.0
         train_loss_d = 0.0
         train_loss_g_adv = 0.0
         train_loss_g_l1 = 0.0
+        train_d_real_mean = 0.0
+        train_d_fake_mean = 0.0
         if discriminator is not None:
             discriminator.train()
 
@@ -776,6 +921,40 @@ def main():
                 train_loss_d += float(loss_d.item())
                 train_loss_g_adv += float(loss_g_adv.item())
                 train_loss_g_l1 += float(loss_g_l1.item())
+            elif is_pix2pix:
+                # y_batch already carries the painted metal when --metal_mask_on_gt is set, so the
+                # L1 target and D's "real" input both respect it.
+                # ---- D step: 0.5 * [BCE(D(x, y), 1) + BCE(D(x, G(x).detach()), 0)] ----
+                optimizer_D.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    d_real = discriminator(x_in, y_batch)
+                    d_fake = discriminator(x_in, pred.detach())
+                    loss_d = 0.5 * (bce_logits(d_real, torch.ones_like(d_real))
+                                    + bce_logits(d_fake, torch.zeros_like(d_fake)))
+                scaler.scale(loss_d).backward()
+                scaler.step(optimizer_D)
+
+                # ---- G step (D frozen): lambda_adv * BCE(D(x, G(x)), 1) + lambda_L1 * L1 ----
+                # L1 = metal-masked L1 on [0, 1] (no SSIM term), x2 = the same L1 in [-1, 1] units.
+                discriminator.requires_grad_(False)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    d_fake_g = discriminator(x_in, pred)
+                    loss_g_adv = bce_logits(d_fake_g, torch.ones_like(d_fake_g))
+                    loss_g_l1 = 2.0 * recon_loss(pred, y_batch, mask_batch, loss_fn, ssim_weight=0.0)
+                    loss = args.gan_lambda_adv * loss_g_adv + args.gan_lambda_l1 * loss_g_l1
+                scaler.scale(loss).backward()
+                discriminator.requires_grad_(True)
+                scaler.step(optimizer)
+                scaler.update()  # single update per iteration covers both optimizers
+                if sched_per_iter:
+                    scheduler.step()
+                    scheduler_D.step()
+
+                train_loss_d += float(loss_d.item())
+                train_loss_g_adv += float(loss_g_adv.item())
+                train_loss_g_l1 += float(loss_g_l1.item())
+                train_d_real_mean += float(torch.sigmoid(d_real.detach().float()).mean().item())
+                train_d_fake_mean += float(torch.sigmoid(d_fake.detach().float()).mean().item())
             else:
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                     if args.loss == 'marmamba':
@@ -787,10 +966,11 @@ def main():
                                           ssim_weight=args.ssim_loss_weight,
                                           ssim_dilation=args.ssim_loss_dilation)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            if not is_pix2pix:  # pix2pix does its own backward/step/scheduler above
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
 
             train_loss += loss.item()
 
@@ -799,6 +979,8 @@ def main():
         avg_loss_d = train_loss_d / n_batches
         avg_loss_g_adv = train_loss_g_adv / n_batches
         avg_loss_g_l1 = train_loss_g_l1 / n_batches
+        avg_d_real_mean = train_d_real_mean / n_batches
+        avg_d_fake_mean = train_d_fake_mean / n_batches
 
         # ---------------- Validation ----------------
         model.eval()
@@ -947,6 +1129,15 @@ def main():
             log_payload["gan/loss_d"] = avg_loss_d
             log_payload["gan/loss_g_adv"] = avg_loss_g_adv
             log_payload["gan/loss_g_l1"] = avg_loss_g_l1
+        if is_pix2pix:
+            log_payload["gan/loss_d"] = avg_loss_d
+            log_payload["gan/loss_g_adv"] = avg_loss_g_adv
+            log_payload["gan/loss_g_l1"] = avg_loss_g_l1
+            # Mean sigmoid(D logits) over the epoch: ~0.5 = balanced, real->1 & fake->0 = D winning.
+            log_payload["gan/d_real_mean"] = avg_d_real_mean
+            log_payload["gan/d_fake_mean"] = avg_d_fake_mean
+            log_payload["gan/lr_g"] = optimizer.param_groups[0]["lr"]
+            log_payload["gan/lr_d"] = optimizer_D.param_groups[0]["lr"]
         wandb.log(log_payload, step=epoch)
         print(
             f"[Epoch {epoch}] Loss: {avg_loss:.4f} "
@@ -954,14 +1145,14 @@ def main():
             f"SSIM: {avg_ssim:.4f} \u00b1 {std_ssim:.4f} "
             f"RMSE: {avg_rmse:.2f} \u00b1 {std_rmse:.2f} HU"
         )
-
-        # ---------------- Save checkpoints ----------------
-        # Save only a rolling "last.pt" (overwritten every epoch)
-        last_ckpt_path = os.path.join(args.log_dir, "last.pt")
-        torch.save({"epoch": epoch, "model_state": model.state_dict()}, last_ckpt_path)
-
-        # Checkpoint saved locally (or to Google Drive if log_dir points there)
-        # Skipped W&B upload via wandb.log_artifact()
+        if is_pix2pix:
+            print(f"    [pix2pix] loss_d={avg_loss_d:.4f} loss_g_adv={avg_loss_g_adv:.4f} "
+                  f"loss_g_l1={avg_loss_g_l1:.4f} D(real)={avg_d_real_mean:.3f} D(fake)={avg_d_fake_mean:.3f} "
+                  f"lr_g={optimizer.param_groups[0]['lr']:.3e} lr_d={optimizer_D.param_groups[0]['lr']:.3e}")
+            if not sched_per_iter:
+                # Per-epoch pix2pix policy: step after logging so the logged LR is the one used this epoch.
+                scheduler.step()
+                scheduler_D.step()
 
         # Pick which metric drives best.pt / early stopping.
         _metric_lookup = {
@@ -974,12 +1165,36 @@ def main():
             best_ckpt_path = os.path.join(args.log_dir, "best.pt")
             torch.save({"epoch": epoch, "model_state": model.state_dict(),
                         "monitor_metric": args.monitor_metric,
-                        "monitor_value": monitored_value}, best_ckpt_path)
+                        "monitor_value": monitored_value,
+                        "model_name": args.model,
+                        "model_kwargs": model_kwargs}, best_ckpt_path)
             # Checkpoint saved locally (or to Google Drive if log_dir points there)
             # Skipped W&B upload via wandb.log_artifact()
             epochs_since_improve = 0
         else:
             epochs_since_improve += 1
+
+        # ---------------- Save checkpoints ----------------
+        # Rolling "last.pt" (overwritten every epoch). Saved after the best/early-stop bookkeeping
+        # so --resume restores the up-to-date best_ssim / epochs_since_improve.
+        # The model (G for pix2pix) stays under "model_state" so existing eval scripts still work.
+        last_ckpt_path = os.path.join(args.log_dir, "last.pt")
+        last_state = {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": scaler.state_dict(),
+            "best_ssim": float(best_ssim),
+            "epochs_since_improve": int(epochs_since_improve),
+            "model_name": args.model,
+            "model_kwargs": model_kwargs,
+        }
+        if is_pix2pix:
+            last_state["discriminator_state"] = discriminator.state_dict()
+            last_state["optimizer_D_state"] = optimizer_D.state_dict()
+            last_state["scheduler_D_state"] = scheduler_D.state_dict()
+        torch.save(last_state, last_ckpt_path)
 
         # ---------------- Early stopping ----------------
         wandb.log({"early_stop/epochs_since_improve": epochs_since_improve,
