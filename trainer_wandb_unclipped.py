@@ -351,7 +351,7 @@ def marmamba_loss(pred, target, mask_batch, lpips_fn, alpha=0.8, beta=0.2, eps=0
     p3 = pred.float().repeat(1, 3, 1, 1)
     t3 = target.float().repeat(1, 3, 1, 1)
     with torch.autocast(device_type=p3.device.type, enabled=False):
-        lp = lpips_fn(p3, t3).mean()
+        lp = lpips_fn(p3, t3, normalize=True).mean()  # pred/target are in [0,1]
     return alpha * charb + beta * lp
 
 # ----------------------------- Main -----------------------------
