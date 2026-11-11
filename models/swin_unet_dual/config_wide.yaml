@@ -1,0 +1,28 @@
+# Capacity control "swin_wide": models/swin_unet_v2/config.yaml with EMBED_DIM 96 -> 126 (heads unchanged,
+# head dim 42 at every stage). 47,317,866 params with 2-channel [MA, LI] input, -0.9% vs swin_dual_xattn
+# (47,766,227). As with the baseline, the trainer only reads IMG_SIZE, PATCH_SIZE, EMBED_DIM, DEPTHS,
+# DECODER_DEPTHS, NUM_HEADS, WINDOW_SIZE, DROP_PATH_RATE, FINAL_UPSAMPLE (+ IN_CHANS/NUM_CLASSES injected).
+MODEL:
+  TYPE: swin
+  NAME: swin_tiny_patch4_window7_224
+  DROP_PATH_RATE: 0.1
+  PRETRAIN_CKPT: "./pretrained_ckpt/swin_tiny_patch4_window7_224.pth"
+  DROP_RATE: 0.0
+  SWIN:
+    FINAL_UPSAMPLE: "expand_first"
+    EMBED_DIM: 126
+    DEPTHS: [ 2, 2, 2, 2]
+    DECODER_DEPTHS: [ 1,2, 2, 2]
+    NUM_HEADS: [ 3, 6, 12, 24]
+    WINDOW_SIZE: 8
+    PATCH_SIZE: 4
+    IN_CHANS: 1
+    MLP_RATIO: 8
+    QKV_BIAS: TRUE
+    APE: TRUE
+    PATCH_NORM: TRUE
+    NUM_CLASSES: 1
+DATA:
+  IMG_SIZE: 512
+TRAIN:
+  USE_CHECKPOINT: FALSE

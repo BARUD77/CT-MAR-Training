@@ -150,7 +150,33 @@ def build_model(name: str,
         model_kwargs.pop("num_classes", None)
         m = SwinUnet3Ch(config=cfg_ns, **model_kwargs)
         return m.to(device)
-    elif name in ("swinunet_v2", "swin_unet_v2", "swinunet-v2"):
+    elif name in ("swin_dual_add", "swin_dual_gate", "swin_dual_xattn"):
+        # Dual-encoder Swin-UNet v2: same [MA, LI] input, split inside the model. --model_cfg is the
+        # baseline models/swin_unet_v2/config.yaml (MA encoder/decoder); li_depths / fuse_stages via --model_kwargs.
+        from models.swin_unet_dual import SwinUnetDual
+        if not model_cfg_path:
+            raise ValueError(f"{name} requires --model_cfg <path to YAML>.")
+        if in_ch != 2:
+            raise ValueError(f"{name} needs the 2-channel [MA, LI] input: use --input_mode ma_li.")
+        cfg_ns = load_config_namespace(model_cfg_path)
+        model_kwargs.pop("num_classes", None)
+        m = SwinUnetDual(
+            fusion=name.rsplit("_", 1)[1],
+            img_size=int(cfg_ns.DATA.IMG_SIZE),
+            patch_size=int(cfg_ns.MODEL.SWIN.PATCH_SIZE),
+            num_classes=int(num_classes),
+            embed_dim=int(cfg_ns.MODEL.SWIN.EMBED_DIM),
+            depths=list(cfg_ns.MODEL.SWIN.DEPTHS),
+            depths_decoder=list(cfg_ns.MODEL.SWIN.DECODER_DEPTHS),
+            num_heads=list(cfg_ns.MODEL.SWIN.NUM_HEADS),
+            window_size=int(cfg_ns.MODEL.SWIN.WINDOW_SIZE),
+            drop_path_rate=float(cfg_ns.MODEL.DROP_PATH_RATE),
+            final_upsample=str(cfg_ns.MODEL.SWIN.FINAL_UPSAMPLE),
+            **model_kwargs
+        )
+        return m.to(device)
+    elif name in ("swinunet_v2", "swin_unet_v2", "swinunet-v2", "swin_wide"):
+        # swin_wide = same class with --model_cfg models/swin_unet_dual/config_wide.yaml (capacity control).
         if not model_cfg_path:
             raise ValueError("SwinUnet V2 requires --model_cfg <path to YAML>.")
         cfg_ns = load_config_namespace(model_cfg_path)
@@ -360,7 +386,8 @@ def main():
     # Model selection / config
     parser.add_argument('--model', type=str,
                         choices=['unet', 'redcnn', 'gan', 'pix2pix', 'swinunet', 'swinunet_fg', 'swinunet_3ch', 'swinunet_v2', 'swinunet_v2_spade',
-                                 'marmamba', 'marvit', 'marpvt', 'marformer'],
+                                 'marmamba', 'marvit', 'marpvt', 'marformer',
+                                 'swin_dual_add', 'swin_dual_gate', 'swin_dual_xattn', 'swin_wide'],
                         required=True,
                         help="Pick an architecture from the registry.")
     parser.add_argument('--model_cfg', type=str, default=None,
@@ -1148,6 +1175,9 @@ def main():
         for region, rs in region_summaries.items():
             for k in ("psnr", "psnr_std", "ssim", "ssim_std", "rmse", "rmse_std", "n"):
                 log_payload[f"val_{region}/{k}"] = rs[k]
+        if hasattr(model, "fusion_alphas"):  # dual-encoder Swin-UNet: per-stage fusion alpha
+            log_payload.update(model.fusion_alphas())
+            print("    " + " ".join(f"{k}={v:+.4f}" for k, v in model.fusion_alphas().items()))
         if is_gan:
             log_payload["gan/loss_d"] = avg_loss_d
             log_payload["gan/loss_g_adv"] = avg_loss_g_adv
