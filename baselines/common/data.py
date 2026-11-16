@@ -35,15 +35,20 @@ DATASET_KWARGS = dict(
 )
 
 
-def build_datasets(ma_dir, gt_dir, li_dir=None, mask_dir=None):
+def build_datasets(ma_dir, gt_dir, li_dir=None, mask_dir=None, split_file=None):
     """Return (train_ds, val_ds) CTMetalArtifactDataset instances.
 
     Samples are tuples in the dataset's order: (ma, gt[, mask][, li]), all (1,H,W) float tensors in
     [0,1] (mask is binary, 1 = metal). Use `unpack_batch` to get named fields.
+    split_file: optional CSV (region,id,split), e.g. splits/grouped_split_v1.csv, replacing the per-slice
+    random split with a scan/patient-wise one. None (default) keeps the original split.
     """
     common = dict(ma_dir=ma_dir, gt_dir=gt_dir, li_dir=li_dir, mask_dir=mask_dir, **DATASET_KWARGS)
     train_ds = CTMetalArtifactDataset(split="train", **common)
     val_ds = CTMetalArtifactDataset(split="val", **common)
+    if split_file:
+        from splits.split_utils import apply_split_file
+        apply_split_file(train_ds, val_ds, split_file)
     return train_ds, val_ds
 
 

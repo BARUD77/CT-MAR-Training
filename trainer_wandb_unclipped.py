@@ -463,6 +463,9 @@ def main():
     parser.add_argument('--entity', type=str, default=None, help='W&B entity (team/user) if needed')
     parser.add_argument('--region_policy', type=str, default='all', choices=['all','body','head'],
                         help='Region filter passed to dataset (defaults to "all").')
+    parser.add_argument('--split_file', type=str, default=None,
+                        help='Optional CSV (region,id,split) that replaces the per-slice random train/val split, '
+                             'e.g. splits/grouped_split_v1.csv (scan/patient-wise). Default: original split.')
 
     # Intensity window (HU) used for clipping/normalization inside the dataset
     parser.add_argument('--hu_min', type=float, default=-1024.0, help='Minimum HU for clipping before normalization')
@@ -674,6 +677,10 @@ def main():
     val_ds   = CTMetalArtifactDataset(**{**dataset_kwargs, "split": "val"})
     # HU validation dataset for HU-domain metrics (no extra np.load inside the loop)
     val_ds_hu = CTMetalArtifactDataset(**{**dataset_kwargs, "split": "val", "output_space": "hu"})
+    # Optional grouped (scan/patient-wise) split from a file; default keeps the dataset's own split.
+    if args.split_file:
+        from splits.split_utils import apply_split_file
+        apply_split_file(train_ds, val_ds, args.split_file)
     # DEBUG-only truncation of the fixed split (default off).
     if args.debug_max_train_samples > 0:
         train_ds.pairs = train_ds.pairs[:args.debug_max_train_samples]

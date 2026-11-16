@@ -1,0 +1,112 @@
+{
+  "params": {
+    "seed": 42,
+    "val_frac": 0.1,
+    "seg_sim": 0.8,
+    "min_block": 5,
+    "head_cut": 0.5,
+    "body_chunk": 50,
+    "body_snap": 15,
+    "twin_sim": 0.999,
+    "twin_min_links": 1
+  },
+  "body": {
+    "n": 12374,
+    "units_before_twin_merge": 246,
+    "twin_merges": 59,
+    "units": 190,
+    "unit_size_median": 53.5,
+    "unit_size_max": 755,
+    "val_units": 25,
+    "val_slices": 1227,
+    "val_frac": 0.09915952804267011,
+    "n_cuts": 245,
+    "cut_consecutive_sim_median": 0.5681953430175781,
+    "frac_cuts_at_clear_break_lt_0.8": 0.7836734693877551
+  },
+  "head": {
+    "n": 1626,
+    "units_before_twin_merge": 8,
+    "twin_merges": 2,
+    "units": 6,
+    "unit_size_median": 233.0,
+    "unit_size_max": 550,
+    "val_units": 1,
+    "val_slices": 176,
+    "val_frac": 0.10824108241082411,
+    "unit_id_ranges": [
+      [
+        1,
+        157,
+        157,
+        false
+      ],
+      [
+        158,
+        338,
+        176,
+        true
+      ],
+      [
+        340,
+        904,
+        550,
+        false
+      ],
+      [
+        910,
+        1124,
+        189,
+        false
+      ],
+      [
+        1125,
+        1410,
+        277,
+        false
+      ],
+      [
+        1411,
+        1773,
+        277,
+        false
+      ]
+    ]
+  },
+  "leakage_old_per_slice_split": {
+    "body": {
+      "n_val": 1237,
+      "n_train": 11137,
+      "median_nn_sim": 0.998175859451294,
+      "frac_nn_above_null_p99.9": 0.9288601455133387,
+      "frac_nn_twin_level_0.999": 0.30962004850444624,
+      "frac_val_with_id_neighbour_in_train": 0.9870654810024252
+    },
+    "head": {
+      "n_val": 163,
+      "n_train": 1463,
+      "median_nn_sim": 0.9970076084136963,
+      "frac_nn_above_null_p99.9": 0.5398773006134969,
+      "frac_nn_twin_level_0.999": 0.3128834355828221,
+      "frac_val_with_id_neighbour_in_train": 0.9570552147239264
+    }
+  },
+  "leakage_new_grouped_split": {
+    "body": {
+      "n_val": 1227,
+      "n_train": 11147,
+      "median_nn_sim": 0.9159248471260071,
+      "frac_nn_above_null_p99.9": 0.17359413202933985,
+      "frac_nn_twin_level_0.999": 0.0,
+      "frac_val_with_id_neighbour_in_train": 0.030969845150774247
+    },
+    "head": {
+      "n_val": 176,
+      "n_train": 1450,
+      "median_nn_sim": 0.8049085140228271,
+      "frac_nn_above_null_p99.9": 0.005681818181818182,
+      "frac_nn_twin_level_0.999": 0.0,
+      "frac_val_with_id_neighbour_in_train": 0.005681818181818182
+    }
+  }
+}
