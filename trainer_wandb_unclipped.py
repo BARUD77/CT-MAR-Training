@@ -511,8 +511,35 @@ def main():
                         help='DEBUG: keep only the first N training slices (0 = all).')
     parser.add_argument('--debug_max_val_samples', type=int, default=0,
                         help='DEBUG: keep only the first N validation slices (0 = all).')
+    parser.add_argument('--artifact_weight', type=float, default=0.0,
+                        help='Artifact-weighted L1 (artifact_loss.py): extra weight lam for artifact-affected pixels, '
+                             'w = 1 + lam*s with s from |blur(MA - GT)| (0 below --artifact_clean_hu, 1 above '
+                             '--artifact_ref_hu); weights rescaled to mean 1. 0 (default) = the usual masked L1.')
+    parser.add_argument('--artifact_lp_weight', type=float, default=0.0,
+                        help='Optional extra term: L1 between blurred (sigma 2 px) prediction and GT on artifact '
+                             'pixels, i.e. coarse error only, ignoring fine target noise. 0 = off.')
+    parser.add_argument('--artifact_clean_hu', type=float, default=15.0)
+    parser.add_argument('--artifact_ref_hu', type=float, default=40.0)
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Optional seed for model init and data order (python, numpy, torch). Default: '
+                             'unseeded, as before. GPU kernels may still be non-deterministic.')
 
     args = parser.parse_args()
+    use_artifact_loss = args.artifact_weight > 0 or args.artifact_lp_weight > 0
+    if use_artifact_loss:
+        if args.loss != 'recon' or args.model.lower() in ('gan', 'unet_gan', 'patch_gan', 'pix2pix'):
+            raise ValueError("--artifact_weight / --artifact_lp_weight only work with --loss recon (non-GAN models).")
+        if args.ssim_loss_weight and args.ssim_loss_weight > 0:
+            raise ValueError("--artifact_weight replaces the L1 term; use --ssim_loss_weight 0 with it.")
+        if not args.mask_dir:
+            raise ValueError("--artifact_weight needs --mask_dir (metal pixels are excluded, as in the usual loss).")
+    if args.seed is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        print(f"[seed] {args.seed}")
 
     # LI is required for ma_li mode and for the feature-gating Swin-UNet
     # (which uses LI to build the soft artifact map A_MG).
@@ -1000,6 +1027,20 @@ def main():
                         loss = marmamba_loss(pred, y_batch, mask_batch, lpips_fn,
                                              alpha=args.loss_alpha, beta=args.loss_beta,
                                              eps=args.charbonnier_eps)
+                    elif use_artifact_loss:
+                        # Training-only weighting; x_batch is the MA input (normalized), y_batch the target.
+                        from artifact_loss import artifact_weighted_loss
+                        first = (epoch == start_epoch and train_loss == 0.0)
+                        out = artifact_weighted_loss(pred, y_batch, x_batch, mask_batch,
+                                                     lam=args.artifact_weight, lp_weight=args.artifact_lp_weight,
+                                                     a_clean=args.artifact_clean_hu, a_ref=args.artifact_ref_hu,
+                                                     return_stats=first)
+                        if first:
+                            loss, st = out
+                            print("[artifact_loss] first batch: " + ", ".join(
+                                f"{k}={v:.4f}" for k, v in st.items() if v is not None))
+                        else:
+                            loss = out
                     else:
                         loss = recon_loss(pred, y_batch, mask_batch, loss_fn,
                                           ssim_weight=args.ssim_loss_weight,
