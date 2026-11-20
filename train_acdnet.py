@@ -34,7 +34,8 @@ from models.acdnet.patch_data import ACDNetPatchDataset, DrawStreamSampler, work
 MODEL_NAME = "acdnet"
 MODEL_ARG_NAMES = ("T", "N", "Np", "d", "num_res", "Mtau", "etaM", "etaX")
 # Arguments that define the training stream; they must not change when resuming.
-STREAM_ARG_NAMES = ("seed", "iters_per_epoch", "batch_slices", "patches_per_slice", "patch_size")
+STREAM_ARG_NAMES = ("seed", "iters_per_epoch", "batch_slices", "patches_per_slice", "patch_size",
+                    "split_file")
 
 
 def parse_args(argv=None):
@@ -44,6 +45,9 @@ def parse_args(argv=None):
     p.add_argument('--gt_dir', type=str, required=True)
     p.add_argument('--li_dir', type=str, required=True)
     p.add_argument('--mask_dir', type=str, required=True)
+    p.add_argument('--split_file', type=str, default=None,
+                   help='Grouped (leak-free) train/val split CSV, e.g. splits/grouped_split_v1.csv; '
+                        'default None keeps the original per-slice split')
     p.add_argument('--hu_min', type=float, default=HU_MIN,
                    help='Must equal the fixed baseline window (baselines/common/data.py).')
     p.add_argument('--hu_max', type=float, default=HU_MAX,
@@ -276,7 +280,8 @@ def main(argv=None):
         torch.backends.cudnn.allow_tf32 = bool(args.tf32)
 
     # ---------------- Data ----------------
-    train_ds, val_ds = build_datasets(args.ma_dir, args.gt_dir, args.li_dir, args.mask_dir)
+    train_ds, val_ds = build_datasets(args.ma_dir, args.gt_dir, args.li_dir, args.mask_dir,
+                                      split_file=args.split_file)
     if args.debug_max_val_samples is not None:
         val_ds = Subset(val_ds, list(range(min(args.debug_max_val_samples, len(val_ds)))))
         val_pairs = [val_ds.dataset.pairs[i] for i in val_ds.indices]
